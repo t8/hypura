@@ -82,6 +82,33 @@ impl LlamaModel {
         Ok(Self { ptr, vocab })
     }
 
+    /// Load a model with custom tensor buffer type overrides.
+    /// `overrides` is a NULL-terminated array of pattern/buft pairs.
+    pub fn load_with_overrides(
+        path: &Path,
+        n_gpu_layers: i32,
+        use_mmap: bool,
+        overrides: *const hypura_sys::llama_model_tensor_buft_override,
+    ) -> anyhow::Result<Self> {
+        let c_path = CString::new(
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid path encoding"))?,
+        )?;
+
+        let mut params = unsafe { hypura_sys::llama_model_default_params() };
+        params.n_gpu_layers = n_gpu_layers;
+        params.use_mmap = use_mmap;
+        params.tensor_buft_overrides = overrides;
+
+        let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
+        anyhow::ensure!(!ptr.is_null(), "Failed to load model from {}", path.display());
+
+        let vocab = unsafe { hypura_sys::llama_model_get_vocab(ptr) };
+        anyhow::ensure!(!vocab.is_null(), "Failed to get vocab from model");
+
+        Ok(Self { ptr, vocab })
+    }
+
     pub fn as_ptr(&self) -> *mut hypura_sys::llama_model {
         self.ptr
     }
@@ -204,6 +231,32 @@ impl LlamaContext {
 
         let ptr = unsafe { hypura_sys::llama_init_from_model(model.as_ptr(), params) };
         anyhow::ensure!(!ptr.is_null(), "Failed to create llama context");
+
+        Ok(Self { ptr })
+    }
+
+    /// Create a context with a cb_eval callback for layer tracking.
+    /// `callback_data` must outlive the context.
+    pub fn new_with_callback(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+    ) -> anyhow::Result<Self> {
+        let mut params = unsafe { hypura_sys::llama_context_default_params() };
+        params.n_ctx = n_ctx;
+        params.n_batch = n_batch;
+        params.n_ubatch = n_batch;
+        params.n_threads = n_threads;
+        params.n_threads_batch = n_threads;
+        params.offload_kqv = true;
+        params.cb_eval = cb_eval;
+        params.cb_eval_user_data = callback_data;
+
+        let ptr = unsafe { hypura_sys::llama_init_from_model(model.as_ptr(), params) };
+        anyhow::ensure!(!ptr.is_null(), "Failed to create llama context with callback");
 
         Ok(Self { ptr })
     }

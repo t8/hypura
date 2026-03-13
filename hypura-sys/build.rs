@@ -40,6 +40,20 @@ fn main() {
     // C++ standard library
     println!("cargo:rustc-link-lib=c++");
 
+    // Compile our custom buffer type C shim
+    let src_dir = PathBuf::from(&manifest_dir).join("src");
+    let include_ggml_internal = llama_dir.join("ggml/src");
+    cc::Build::new()
+        .file(src_dir.join("hypura_buft.c"))
+        .include(&llama_dir.join("include"))
+        .include(&llama_dir.join("ggml/include"))
+        .include(&include_ggml_internal)
+        .include(&src_dir)
+        .flag("-std=c11")
+        .compile("hypura_buft");
+    println!("cargo:rerun-if-changed=src/hypura_buft.c");
+    println!("cargo:rerun-if-changed=src/hypura_buft.h");
+
     // Generate Rust bindings via bindgen
     let include_llama = llama_dir.join("include");
     let include_ggml = llama_dir.join("ggml/include");
@@ -54,12 +68,15 @@ fn main() {
         )
         .clang_arg(format!("-I{}", include_llama.display()))
         .clang_arg(format!("-I{}", include_ggml.display()))
+        .clang_arg(format!("-I{}", src_dir.display()))
         .allowlist_function("llama_.*")
         .allowlist_function("ggml_.*")
         .allowlist_function("gguf_.*")
+        .allowlist_function("hypura_.*")
         .allowlist_type("llama_.*")
         .allowlist_type("ggml_.*")
         .allowlist_type("gguf_.*")
+        .allowlist_type("hypura_.*")
         .allowlist_var("LLAMA_.*")
         .allowlist_var("GGML_.*")
         .allowlist_var("GGUF_.*")

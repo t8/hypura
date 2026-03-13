@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -151,6 +152,156 @@ pub fn generate_blocking(
         }
 
         ctx.decode(&[token_id])?;
+    }
+
+    let perf = ctx.perf();
+    let total_gen_time = gen_start.elapsed().as_secs_f64();
+    let avg_tps = if total_gen_time > 0.0 {
+        n_generated as f64 / total_gen_time
+    } else {
+        0.0
+    };
+
+    Ok(GenerationResult {
+        text: generated_text,
+        tokens_generated: n_generated,
+        prompt_tokens: prompt_len,
+        tok_per_sec_avg: avg_tps,
+        prompt_eval_ms: prompt_ms,
+        perf,
+    })
+}
+
+/// Run inference with NVMe-aware tensor scheduling.
+/// Uses custom buffer type for NVMe-tier tensors + cb_eval for layer tracking.
+pub fn generate_with_nvme_scheduling(
+    model_path: &Path,
+    prompt: &str,
+    config: &InferenceConfig,
+    n_gpu_layers: i32,
+    plan: &PlacementPlan,
+    gguf: &GgufFile,
+    token_tx: mpsc::UnboundedSender<GeneratedToken>,
+    telemetry: Arc<TelemetryEmitter>,
+) -> anyhow::Result<GenerationResult> {
+    use crate::compute::nvme_backend::{
+        build_override_patterns, eval_callback, HypuraBuftController,
+    };
+
+    let _backend = LlamaBackend::init();
+
+    // Check if there are any NVMe tensors
+    let has_nvme = plan
+        .tier_assignments
+        .values()
+        .any(|t| *t == StorageTier::Nvme);
+
+    if !has_nvme {
+        // No NVMe tensors — fall back to standard path
+        return generate_blocking(model_path, prompt, config, n_gpu_layers, token_tx, telemetry);
+    }
+
+    // Create custom buffer type for NVMe-tier tensors
+    let controller = HypuraBuftController::new(model_path, gguf);
+    let (_patterns, overrides) = build_override_patterns(plan, gguf, controller.buft_ptr());
+
+    tracing::info!(
+        "NVMe scheduling: {} tensors on custom buffer type",
+        plan.tier_assignments
+            .values()
+            .filter(|t| **t == StorageTier::Nvme)
+            .count()
+    );
+
+    // Load model with overrides
+    let model = LlamaModel::load_with_overrides(
+        model_path,
+        n_gpu_layers,
+        true, // use_mmap for GPU/RAM tensors
+        overrides.as_ptr(),
+    )?;
+
+    // Finalize tensor map with file offsets
+    controller.finalize_tensor_map(gguf);
+
+    let nvme_tensor_count = controller.tensor_map().lock().unwrap().len();
+    tracing::info!("Custom buffer loaded {nvme_tensor_count} tensors");
+
+    // Create context with cb_eval callback for layer tracking
+    let current_layer = controller.current_layer();
+    let layer_ptr = Arc::into_raw(current_layer.clone()) as *mut std::ffi::c_void;
+
+    let mut ctx = LlamaContext::new_with_callback(
+        &model,
+        config.n_ctx,
+        config.n_batch,
+        config.n_threads,
+        Some(eval_callback),
+        layer_ptr,
+    )?;
+
+    let mut sampler = LlamaSampler::new(&config.sampling);
+
+    // Tokenize prompt
+    let tokens = model.tokenize(prompt, true);
+    let prompt_len = tokens.len() as u32;
+    anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
+
+    // Process prompt
+    let prompt_start = Instant::now();
+    let batch_size = config.n_batch as usize;
+    for chunk in tokens.chunks(batch_size) {
+        ctx.decode(chunk)?;
+    }
+    let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Generation loop (same as standard, but with layer tracking active)
+    let mut generated_text = String::new();
+    let mut n_generated: u32 = 0;
+    let gen_start = Instant::now();
+
+    for _ in 0..config.sampling.max_tokens {
+        let token_id = sampler.sample(&mut ctx, -1);
+        let is_eog = model.is_eog(token_id);
+        let piece = model.token_to_piece(token_id);
+
+        n_generated += 1;
+        generated_text.push_str(&piece);
+
+        let elapsed = gen_start.elapsed().as_secs_f64();
+        let tok_per_sec = if elapsed > 0.0 {
+            n_generated as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        telemetry.emit(TelemetryEvent::TokenGenerated {
+            tok_per_sec,
+            token: piece.clone(),
+        });
+
+        if token_tx
+            .send(GeneratedToken {
+                text: piece,
+                token_id,
+                tok_per_sec,
+                is_eog,
+            })
+            .is_err()
+        {
+            break;
+        }
+
+        if is_eog {
+            break;
+        }
+
+        ctx.decode(&[token_id])?;
+    }
+
+    // Clean up the Arc we leaked into the callback
+    unsafe {
+        Arc::from_raw(layer_ptr as *const AtomicI32);
     }
 
     let perf = ctx.perf();

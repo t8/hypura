@@ -6,7 +6,7 @@ use hypura::compute::inference::*;
 use hypura::model::gguf::GgufFile;
 use hypura::profiler;
 use hypura::scheduler::placement::{compute_placement, summarize_placement};
-use hypura::scheduler::types::PlacementSummary;
+use hypura::scheduler::types::{PlacementSummary, StorageTier};
 use hypura::telemetry::metrics::TelemetryEmitter;
 
 use super::fmt_util::format_bytes;
@@ -47,6 +47,12 @@ async fn run_async(
     let summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
     let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf);
 
+    let has_nvme = plan.tier_assignments.values().any(|t| *t == StorageTier::Nvme);
+    if has_nvme {
+        println!("  NVMe scheduling: ENABLED ({} tensors on SSD)",
+            plan.tier_assignments.values().filter(|t| **t == StorageTier::Nvme).count());
+    }
+
     print_placement_header(&summary, &plan, n_gpu_layers);
 
     let telemetry = Arc::new(TelemetryEmitter::new(256));
@@ -55,13 +61,16 @@ async fn run_async(
         ..InferenceConfig::default()
     };
 
+    // Clone what we need for the blocking thread
+    let plan = Arc::new(plan);
+    let gguf = Arc::new(gguf);
+
     if interactive {
-        run_interactive(path, &config, n_gpu_layers, telemetry).await
+        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry).await
     } else if let Some(prompt_text) = prompt {
-        run_single_prompt(path, prompt_text, &config, n_gpu_layers, telemetry).await
+        run_single_prompt(path, prompt_text, &config, n_gpu_layers, &plan, &gguf, telemetry).await
     } else {
-        // Default to interactive if no --prompt given
-        run_interactive(path, &config, n_gpu_layers, telemetry).await
+        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry).await
     }
 }
 
@@ -70,6 +79,8 @@ async fn run_single_prompt(
     prompt: &str,
     config: &InferenceConfig,
     n_gpu_layers: i32,
+    plan: &Arc<hypura::scheduler::types::PlacementPlan>,
+    gguf: &Arc<GgufFile>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<()> {
     let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -77,10 +88,21 @@ async fn run_single_prompt(
     let path = model_path.to_path_buf();
     let prompt_owned = prompt.to_string();
     let config_clone = config.clone();
+    let plan_clone = plan.clone();
+    let gguf_clone = gguf.clone();
 
     println!("Loading model...");
     let handle = tokio::task::spawn_blocking(move || {
-        generate_blocking(&path, &prompt_owned, &config_clone, n_gpu_layers, token_tx, telemetry)
+        generate_with_nvme_scheduling(
+            &path,
+            &prompt_owned,
+            &config_clone,
+            n_gpu_layers,
+            &plan_clone,
+            &gguf_clone,
+            token_tx,
+            telemetry,
+        )
     });
 
     // Stream tokens to stdout
@@ -103,6 +125,8 @@ async fn run_interactive(
     model_path: &Path,
     config: &InferenceConfig,
     n_gpu_layers: i32,
+    plan: &Arc<hypura::scheduler::types::PlacementPlan>,
+    gguf: &Arc<GgufFile>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<()> {
     println!("Hypura Interactive Mode");
@@ -136,9 +160,13 @@ async fn run_interactive(
         let prompt = full_prompt;
         let cfg = config.clone();
         let telem = telemetry.clone();
+        let plan_c = plan.clone();
+        let gguf_c = gguf.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
-            generate_blocking(&path, &prompt, &cfg, n_gpu_layers, token_tx, telem)
+            generate_with_nvme_scheduling(
+                &path, &prompt, &cfg, n_gpu_layers, &plan_c, &gguf_c, token_tx, telem,
+            )
         });
 
         let mut response = String::new();

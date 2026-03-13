@@ -5,3 +5,4 @@
 #include "ggml-metal.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
+#include "hypura_buft.h"
