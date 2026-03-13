@@ -1,0 +1,10 @@
+[package]
+name = "hypura-sys"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings to llama.cpp for hypura"
+links = "llama"
+
+[build-dependencies]
+cmake = "0.1"
+bindgen = "0.71"

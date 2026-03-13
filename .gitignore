@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+*.pdb
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model files (too large for git)
+*.gguf
+*.safetensors
+*.onnx
+*.bin
+
+# Test model downloads
+/test-models/
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace

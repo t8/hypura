@@ -1,0 +1,54 @@
+[workspace]
+members = ["hypura-sys", "."]
+resolver = "2"
+
+[package]
+name = "hypura"
+version = "0.1.0"
+edition = "2021"
+description = "Storage-tier-aware LLM inference scheduler"
+license = "MIT"
+default-run = "hypura"
+
+[[bin]]
+name = "hypura"
+path = "src/main.rs"
+
+[dependencies]
+hypura-sys = { path = "hypura-sys" }
+
+# CLI and config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Async runtime and HTTP
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# LP solver
+good_lp = { version = "1", features = ["highs"] }
+
+# System profiling
+sysinfo = "0.31"
+
+# Logging and diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+byteorder = "1"
+memmap2 = "0.9"
+linked-hash-map = "0.5"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
