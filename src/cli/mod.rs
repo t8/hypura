@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod estimate;
+pub mod fmt_util;
 pub mod inspect;
 pub mod optimize;
 pub mod profile;

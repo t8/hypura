@@ -30,10 +30,11 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 
 # LP solver
-good_lp = { version = "1", features = ["highs"] }
+good_lp = { version = "1", default-features = false, features = ["highs"] }
 
 # System profiling
 sysinfo = "0.31"
+libc = "0.2"
 
 # Logging and diagnostics
 tracing = "0.1"
