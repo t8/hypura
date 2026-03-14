@@ -56,7 +56,7 @@ static void hypura_buf_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tens
     /* Notify Rust of this tensor's location */
     if (ctx->buft_ctx->on_tensor_loaded && offset == 0) {
         size_t buf_offset = (uint8_t *)tensor->data - (uint8_t *)ctx->base;
-        ctx->buft_ctx->on_tensor_loaded(ctx->buft_ctx->rust_ctx, tensor->name, buf_offset, size);
+        ctx->buft_ctx->on_tensor_loaded(ctx->buft_ctx->rust_ctx, tensor->name, buf_offset, size, ctx->base);
     }
 }
 

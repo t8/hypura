@@ -54,32 +54,45 @@ pub struct GenerationResult {
 
 /// Derive `n_gpu_layers` from a PlacementPlan.
 ///
-/// Counts the longest contiguous prefix of layers (starting from layer 0)
-/// where ALL tensors in that layer are assigned to `StorageTier::Gpu`.
-/// This maps our fine-grained placement to llama.cpp's single `n_gpu_layers` knob.
+/// Only offload layers to GPU where NO tensor is on NVMe. Layers with any
+/// NVMe tensor stay on CPU — the custom buffer type + eval callback handles
+/// prefetch/release for those layers. This keeps Metal's working set within
+/// `recommendedMaxWorkingSetSize` and prevents GPU OOM on models that exceed
+/// physical memory.
+///
+/// Since llama.cpp's `n_gpu_layers` is sequential (layers 0..N go to GPU),
+/// we offload up to (but not including) the first layer with an NVMe tensor.
 pub fn gpu_layers_from_placement(plan: &PlacementPlan, gguf: &GgufFile) -> i32 {
-    let mut layer_all_gpu: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut max_layer: i32 = -1;
+    let mut first_nvme_layer: Option<u32> = None;
 
     for t in &gguf.tensors {
         if let Some(layer_idx) = t.layer_index {
-            let tier = plan.tier_assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
-            let entry = layer_all_gpu.entry(layer_idx).or_insert(true);
-            if *tier != StorageTier::Gpu {
-                *entry = false;
+            max_layer = max_layer.max(layer_idx as i32);
+            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
+                first_nvme_layer = Some(match first_nvme_layer {
+                    Some(existing) => existing.min(layer_idx),
+                    None => layer_idx,
+                });
             }
         }
     }
 
-    // Count contiguous prefix of fully-GPU layers
-    let mut count = 0i32;
-    for idx in 0.. {
-        match layer_all_gpu.get(&idx) {
-            Some(true) => count += 1,
-            _ => break,
-        }
+    if max_layer < 0 {
+        return 0;
     }
 
-    count
+    match first_nvme_layer {
+        Some(nvme_start) => {
+            // Offload layers 0..(nvme_start-1) to GPU.
+            // +1 for the output layer llama.cpp counts separately.
+            nvme_start as i32 + 1
+        }
+        None => {
+            // No NVMe tensors — offload everything.
+            max_layer + 1 + 1
+        }
+    }
 }
 
 /// Run inference on a blocking thread. Streams tokens via `token_tx`.
@@ -185,7 +198,7 @@ pub fn generate_with_nvme_scheduling(
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<GenerationResult> {
     use crate::compute::nvme_backend::{
-        build_override_patterns, eval_callback, HypuraBuftController,
+        build_override_patterns, eval_callback, HypuraBuftController, PrefetchState,
     };
 
     let _backend = LlamaBackend::init();
@@ -197,7 +210,6 @@ pub fn generate_with_nvme_scheduling(
         .any(|t| *t == StorageTier::Nvme);
 
     if !has_nvme {
-        // No NVMe tensors — fall back to standard path
         return generate_blocking(model_path, prompt, config, n_gpu_layers, token_tx, telemetry);
     }
 
@@ -205,31 +217,39 @@ pub fn generate_with_nvme_scheduling(
     let controller = HypuraBuftController::new(model_path, gguf);
     let (_patterns, overrides) = build_override_patterns(plan, gguf, controller.buft_ptr());
 
-    tracing::info!(
-        "NVMe scheduling: {} tensors on custom buffer type",
-        plan.tier_assignments
-            .values()
-            .filter(|t| **t == StorageTier::Nvme)
-            .count()
-    );
+    let nvme_count = plan
+        .tier_assignments
+        .values()
+        .filter(|t| **t == StorageTier::Nvme)
+        .count();
+    tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
     // Load model with overrides
     let model = LlamaModel::load_with_overrides(
         model_path,
         n_gpu_layers,
-        true, // use_mmap for GPU/RAM tensors
+        true,
         overrides.as_ptr(),
     )?;
 
-    // Finalize tensor map with file offsets
-    controller.finalize_tensor_map(gguf);
+    // Build prefetch state with layer groupings and file offsets
+    let num_layers = model.n_layers() as u32;
+    let prefetch_state = controller.build_prefetch_state(gguf, num_layers);
 
-    let nvme_tensor_count = controller.tensor_map().lock().unwrap().len();
-    tracing::info!("Custom buffer loaded {nvme_tensor_count} tensors");
+    // Open NVMe file descriptor for F_NOCACHE reads during prefetch
+    prefetch_state.open_nvme_fd()?;
 
-    // Create context with cb_eval callback for layer tracking
-    let current_layer = controller.current_layer();
-    let layer_ptr = Arc::into_raw(current_layer.clone()) as *mut std::ffi::c_void;
+    // Start background prefetch thread for async layer preloading
+    let prefetch_handle = prefetch_state.start_prefetch_thread();
+
+    let nvme_tensor_count = prefetch_state.tensor_map.len();
+    let nvme_layer_count = prefetch_state.layer_regions.len();
+    tracing::info!(
+        "Prefetch state: {nvme_tensor_count} tensors across {nvme_layer_count} layers"
+    );
+
+    // Pass PrefetchState to cb_eval callback
+    let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
 
     let mut ctx = LlamaContext::new_with_callback(
         &model,
@@ -237,7 +257,7 @@ pub fn generate_with_nvme_scheduling(
         config.n_batch,
         config.n_threads,
         Some(eval_callback),
-        layer_ptr,
+        state_ptr,
     )?;
 
     let mut sampler = LlamaSampler::new(&config.sampling);
@@ -255,7 +275,7 @@ pub fn generate_with_nvme_scheduling(
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Generation loop (same as standard, but with layer tracking active)
+    // Generation loop with active prefetch/release
     let mut generated_text = String::new();
     let mut n_generated: u32 = 0;
     let gen_start = Instant::now();
@@ -299,9 +319,15 @@ pub fn generate_with_nvme_scheduling(
         ctx.decode(&[token_id])?;
     }
 
+    // Stop prefetch thread and clean up
+    prefetch_state.stop_prefetch_thread();
+    if let Some(handle) = prefetch_handle {
+        let _ = handle.join();
+    }
+
     // Clean up the Arc we leaked into the callback
     unsafe {
-        Arc::from_raw(layer_ptr as *const AtomicI32);
+        Arc::from_raw(state_ptr as *const PrefetchState);
     }
 
     let perf = ctx.perf();
@@ -362,14 +388,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gpu_layers_all_gpu() {
-        let gguf = make_gguf(10, 3);
-        let mut assignments = HashMap::new();
-        for t in &gguf.tensors {
-            assignments.insert(t.name.clone(), StorageTier::Gpu);
-        }
-        let plan = PlacementPlan {
+    fn make_plan(assignments: HashMap<String, StorageTier>) -> PlacementPlan {
+        PlacementPlan {
             model_id: "test".into(),
             hardware_profile_hash: "".into(),
             tier_assignments: assignments,
@@ -382,63 +402,51 @@ mod tests {
                 hot_bytes: 0, warm_bytes: 0,
             },
             experience_tier: ExperienceTier::Fast,
-        };
-        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 10);
+        }
     }
 
     #[test]
-    fn test_gpu_layers_partial() {
+    fn test_gpu_layers_offloads_all() {
+        // On unified memory, all layers should be GPU-offloaded
+        // regardless of individual tensor tier assignments
         let gguf = make_gguf(10, 3);
         let mut assignments = HashMap::new();
         for t in &gguf.tensors {
-            let layer = t.layer_index.unwrap();
-            let tier = if layer < 6 { StorageTier::Gpu } else { StorageTier::Ram };
-            assignments.insert(t.name.clone(), tier);
+            assignments.insert(t.name.clone(), StorageTier::Gpu);
         }
-        let plan = PlacementPlan {
-            model_id: "test".into(),
-            hardware_profile_hash: "".into(),
-            tier_assignments: assignments,
-            prefetch_schedule: PrefetchSchedule { layer_prefetches: vec![] },
-            estimated_tok_per_sec: 0.0,
-            estimated_time_to_first_token: 0.0,
-            kv_cache_plan: KvCachePlan {
-                hot_window_tokens: 0, warm_window_tokens: 0,
-                hot_tier: StorageTier::Gpu, warm_tier: StorageTier::Ram,
-                hot_bytes: 0, warm_bytes: 0,
-            },
-            experience_tier: ExperienceTier::Usable,
-        };
-        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 6);
+        let plan = make_plan(assignments);
+        // 10 layers (0-9) + 1 output = 11
+        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 11);
     }
 
     #[test]
-    fn test_gpu_layers_mixed_within_layer() {
-        let gguf = make_gguf(5, 3);
+    fn test_gpu_layers_mixed_tiers_stops_at_nvme() {
+        // Only offload layers before the first NVMe layer
+        // Layers 0-5 on GPU, layers 6-9 on NVMe
+        let gguf = make_gguf(10, 3);
         let mut assignments = HashMap::new();
         for t in &gguf.tensors {
-            // Layer 0: first tensor on GPU, rest on RAM → not fully GPU
-            let tier = if t.layer_index == Some(0) && t.name.contains("tensor_0") {
+            let tier = if t.layer_index.unwrap() < 6 {
                 StorageTier::Gpu
             } else {
-                StorageTier::Ram
+                StorageTier::Nvme
             };
             assignments.insert(t.name.clone(), tier);
         }
-        let plan = PlacementPlan {
-            model_id: "test".into(),
-            hardware_profile_hash: "".into(),
-            tier_assignments: assignments,
-            prefetch_schedule: PrefetchSchedule { layer_prefetches: vec![] },
-            estimated_tok_per_sec: 0.0,
-            estimated_time_to_first_token: 0.0,
-            kv_cache_plan: KvCachePlan {
-                hot_window_tokens: 0, warm_window_tokens: 0,
-                hot_tier: StorageTier::Gpu, warm_tier: StorageTier::Ram,
-                hot_bytes: 0, warm_bytes: 0,
-            },
-            experience_tier: ExperienceTier::Slow,
+        let plan = make_plan(assignments);
+        // Layers 0-5 on GPU (6 layers) + 1 output = 7
+        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 7);
+    }
+
+    #[test]
+    fn test_gpu_layers_empty() {
+        let gguf = GgufFile {
+            version: 3,
+            metadata: Default::default(),
+            tensors: vec![],
+            data_offset: 0,
         };
+        let plan = make_plan(HashMap::new());
         assert_eq!(gpu_layers_from_placement(&plan, &gguf), 0);
     }
 }

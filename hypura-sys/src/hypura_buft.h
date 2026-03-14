@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /* Callbacks from C into Rust during model loading */
-typedef void (*hypura_on_tensor_loaded_t)(void *rust_ctx, const char *name, size_t offset, size_t size);
+typedef void (*hypura_on_tensor_loaded_t)(void *rust_ctx, const char *name, size_t offset, size_t size, void *buffer_base);
 typedef void (*hypura_on_tensor_init_t)(void *rust_ctx, struct ggml_tensor *tensor, const char *name);
 
 /* Create a custom buffer type for NVMe-tier tensors.

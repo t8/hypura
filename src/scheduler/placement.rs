@@ -154,6 +154,7 @@ struct ScoredTensor {
     size_bytes: u64,
     score: f64,
     access_freq: f64,
+    layer_index: Option<u32>,
 }
 
 fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<ScoredTensor> {
@@ -181,6 +182,7 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
                 size_bytes: t.size_bytes,
                 score,
                 access_freq,
+                layer_index: t.layer_index,
             }
         })
         .collect()
@@ -190,22 +192,67 @@ fn greedy_assign(
     tensors: &[ScoredTensor],
     caps: &TierCapacities,
 ) -> HashMap<String, StorageTier> {
-    let mut sorted: Vec<&ScoredTensor> = tensors.iter().collect();
-    sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-
-    let mut gpu_remaining = caps.gpu_bytes;
-    let mut ram_remaining = caps.ram_bytes;
     let mut assignments = HashMap::new();
 
-    for t in sorted {
-        if t.size_bytes <= gpu_remaining {
+    // Separate layer tensors from non-layer tensors (embedding, output head, etc.)
+    let mut layer_tensors: std::collections::BTreeMap<u32, Vec<&ScoredTensor>> =
+        std::collections::BTreeMap::new();
+    let mut non_layer_tensors: Vec<&ScoredTensor> = Vec::new();
+
+    for t in tensors {
+        if let Some(layer) = t.layer_index {
+            layer_tensors.entry(layer).or_default().push(t);
+        } else {
+            non_layer_tensors.push(t);
+        }
+    }
+
+    // Assign non-layer tensors to GPU/RAM first (these are always accessed)
+    non_layer_tensors.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    let mut gpu_remaining = caps.gpu_bytes;
+    let mut unified_remaining = caps.unified_limit;
+
+    for t in &non_layer_tensors {
+        if t.size_bytes <= gpu_remaining && t.size_bytes <= unified_remaining {
             gpu_remaining -= t.size_bytes;
+            unified_remaining -= t.size_bytes;
             assignments.insert(t.name.clone(), StorageTier::Gpu);
-        } else if t.size_bytes <= ram_remaining {
-            ram_remaining -= t.size_bytes;
+        } else if t.size_bytes <= unified_remaining {
+            unified_remaining -= t.size_bytes;
             assignments.insert(t.name.clone(), StorageTier::Ram);
         } else {
             assignments.insert(t.name.clone(), StorageTier::Nvme);
+        }
+    }
+
+    // Assign layers contiguously: lowest layers to GPU/RAM, rest to NVMe.
+    // Once a layer doesn't fit, all remaining layers go to NVMe (contiguity).
+    let mut nvme_cutoff = false;
+
+    for (_layer_idx, layer_ts) in &layer_tensors {
+        let layer_size: u64 = layer_ts.iter().map(|t| t.size_bytes).sum();
+
+        if !nvme_cutoff && layer_size <= unified_remaining {
+            unified_remaining -= layer_size;
+
+            // Within this layer, split GPU vs RAM by tensor score
+            let mut sorted_layer: Vec<&&ScoredTensor> = layer_ts.iter().collect();
+            sorted_layer.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+            for t in sorted_layer {
+                if t.size_bytes <= gpu_remaining {
+                    gpu_remaining -= t.size_bytes;
+                    assignments.insert(t.name.clone(), StorageTier::Gpu);
+                } else {
+                    assignments.insert(t.name.clone(), StorageTier::Ram);
+                }
+            }
+        } else {
+            nvme_cutoff = true;
+            for t in layer_ts {
+                assignments.insert(t.name.clone(), StorageTier::Nvme);
+            }
         }
     }
 
@@ -229,8 +276,22 @@ fn lp_assign(
     let ram_bw = hw.memory.bandwidth_bytes_per_sec as f64;
     let nvme_bw = caps.nvme_peak_bw as f64;
 
-    // Create variables: x_gpu[i], x_ram[i], x_nvme[i] continuous in [0, 1]
-    // (LP relaxation of binary — round afterwards)
+    // Collect unique layer indices (sorted ascending) for contiguity constraints
+    let mut layer_set = std::collections::BTreeSet::new();
+    for t in tensors {
+        if let Some(l) = t.layer_index {
+            layer_set.insert(l);
+        }
+    }
+    let layer_indices: Vec<u32> = layer_set.into_iter().collect();
+    let layer_pos: HashMap<u32, usize> = layer_indices
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (l, i))
+        .collect();
+    let num_layers = layer_indices.len();
+
+    // Create binary variables (MIP — no rounding needed)
     variables! {
         vars:
     }
@@ -240,9 +301,15 @@ fn lp_assign(
     let mut x_nvme = Vec::with_capacity(n);
 
     for _ in 0..n {
-        x_gpu.push(vars.add(variable().min(0.0).max(1.0)));
-        x_ram.push(vars.add(variable().min(0.0).max(1.0)));
-        x_nvme.push(vars.add(variable().min(0.0).max(1.0)));
+        x_gpu.push(vars.add(variable().binary()));
+        x_ram.push(vars.add(variable().binary()));
+        x_nvme.push(vars.add(variable().binary()));
+    }
+
+    // Binary variable per layer: 1 = NVMe, 0 = GPU/RAM
+    let mut layer_nvme = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        layer_nvme.push(vars.add(variable().binary()));
     }
 
     // Objective: minimize weighted latency
@@ -282,39 +349,39 @@ fn lp_assign(
     }
     problem = problem.with(constraint!(unified_sum <= caps.unified_limit as f64));
 
+    // Layer contiguity: monotonicity — once NVMe starts, it stays NVMe
+    // layer_nvme[L] >= layer_nvme[L-1] for consecutive layers
+    for j in 1..num_layers {
+        problem = problem.with(constraint!(layer_nvme[j] >= layer_nvme[j - 1]));
+    }
+
+    // Link tensor NVMe vars to layer NVMe vars:
+    // All tensors in a layer share the same NVMe/non-NVMe assignment
+    for (i, t) in tensors.iter().enumerate() {
+        if let Some(layer) = t.layer_index {
+            if let Some(&j) = layer_pos.get(&layer) {
+                problem = problem.with(constraint!(x_nvme[i] == layer_nvme[j]));
+            }
+        }
+    }
+
     let solution = problem.solve()?;
 
-    // Round LP relaxation to integer assignment
+    // Extract assignments — MIP gives integer solution, no rounding needed
     let mut assignments = HashMap::new();
     for (i, t) in tensors.iter().enumerate() {
         let g = solution.value(x_gpu[i]);
         let r = solution.value(x_ram[i]);
-        let v = solution.value(x_nvme[i]);
+        let _v = solution.value(x_nvme[i]);
 
-        let tier = if g >= r && g >= v {
+        let tier = if g > 0.5 {
             StorageTier::Gpu
-        } else if r >= v {
+        } else if r > 0.5 {
             StorageTier::Ram
         } else {
             StorageTier::Nvme
         };
         assignments.insert(t.name.clone(), tier);
-    }
-
-    // Post-hoc capacity check — if rounding violated constraints, fall back to greedy
-    let gpu_used: u64 = assignments
-        .iter()
-        .filter(|(_, t)| **t == StorageTier::Gpu)
-        .map(|(name, _)| tensors.iter().find(|t| t.name == *name).unwrap().size_bytes)
-        .sum();
-    let ram_used: u64 = assignments
-        .iter()
-        .filter(|(_, t)| **t == StorageTier::Ram)
-        .map(|(name, _)| tensors.iter().find(|t| t.name == *name).unwrap().size_bytes)
-        .sum();
-
-    if gpu_used > caps.gpu_bytes || ram_used > caps.ram_bytes || gpu_used + ram_used > caps.unified_limit {
-        anyhow::bail!("LP rounding violated capacity constraints");
     }
 
     Ok(assignments)
@@ -496,6 +563,7 @@ mod tests {
                 size_bytes: 1 << 30, // 1 GB each
                 score: 10.0 - i as f64,
                 access_freq: 1.0,
+                layer_index: None,
             })
             .collect();
 
@@ -515,6 +583,64 @@ mod tests {
         assert_eq!(gpu_count, 3);
         assert_eq!(ram_count, 4);
         assert_eq!(nvme_count, 3);
+    }
+
+    #[test]
+    fn test_greedy_layer_contiguity() {
+        let tensors: Vec<ScoredTensor> = (0..10)
+            .map(|i| ScoredTensor {
+                name: format!("blk.{i}.attn_q.weight"),
+                size_bytes: 1 << 30,
+                score: 10.0 - i as f64,
+                access_freq: 1.0,
+                layer_index: Some(i as u32),
+            })
+            .collect();
+
+        let caps = TierCapacities {
+            gpu_bytes: 3 << 30,
+            ram_bytes: 4 << 30,
+            unified_limit: 7 << 30,
+            nvme_peak_bw: 5_000_000_000,
+        };
+
+        let assignments = greedy_assign(&tensors, &caps);
+
+        // Verify contiguity: no NVMe tensor has a lower layer than any GPU/RAM tensor
+        let max_resident_layer = assignments
+            .iter()
+            .filter(|(_, t)| **t != StorageTier::Nvme)
+            .filter_map(|(name, _)| test_parse_layer(name))
+            .max();
+
+        let min_nvme_layer = assignments
+            .iter()
+            .filter(|(_, t)| **t == StorageTier::Nvme)
+            .filter_map(|(name, _)| test_parse_layer(name))
+            .min();
+
+        if let (Some(max_r), Some(min_n)) = (max_resident_layer, min_nvme_layer) {
+            assert!(
+                max_r < min_n,
+                "Contiguity violated: resident up to layer {max_r} but NVMe from {min_n}"
+            );
+        }
+
+        // 7 layers fit in 7 GB unified, 3 on NVMe
+        let nvme_count = assignments
+            .values()
+            .filter(|t| **t == StorageTier::Nvme)
+            .count();
+        assert_eq!(nvme_count, 3);
+    }
+
+    fn test_parse_layer(name: &str) -> Option<u32> {
+        if name.starts_with("blk.") {
+            let rest = &name[4..];
+            rest.split('.').next()?.parse().ok()
+        } else {
+            None
+        }
     }
 
     #[test]
