@@ -221,18 +221,7 @@ pub struct LlamaContext {
 impl LlamaContext {
     /// Create a new inference context from a loaded model.
     pub fn new(model: &LlamaModel, n_ctx: u32, n_batch: u32, n_threads: i32) -> anyhow::Result<Self> {
-        let mut params = unsafe { hypura_sys::llama_context_default_params() };
-        params.n_ctx = n_ctx;
-        params.n_batch = n_batch;
-        params.n_ubatch = n_batch;
-        params.n_threads = n_threads;
-        params.n_threads_batch = n_threads;
-        params.offload_kqv = true;
-
-        let ptr = unsafe { hypura_sys::llama_init_from_model(model.as_ptr(), params) };
-        anyhow::ensure!(!ptr.is_null(), "Failed to create llama context");
-
-        Ok(Self { ptr })
+        Self::new_inner(model, n_ctx, n_batch, n_threads, None, std::ptr::null_mut(), None)
     }
 
     /// Create a context with a cb_eval callback for layer tracking.
@@ -245,6 +234,33 @@ impl LlamaContext {
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
     ) -> anyhow::Result<Self> {
+        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, None)
+    }
+
+    /// Create a context with callback and KV cache quantization.
+    pub fn new_with_callback_and_kv(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+        kv_quant: Option<crate::scheduler::types::KvQuantization>,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, kv_quant)
+    }
+
+    fn new_inner(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+        kv_quant: Option<crate::scheduler::types::KvQuantization>,
+    ) -> anyhow::Result<Self> {
+        use crate::scheduler::types::KvQuantization;
+
         let mut params = unsafe { hypura_sys::llama_context_default_params() };
         params.n_ctx = n_ctx;
         params.n_batch = n_batch;
@@ -252,11 +268,25 @@ impl LlamaContext {
         params.n_threads = n_threads;
         params.n_threads_batch = n_threads;
         params.offload_kqv = true;
-        params.cb_eval = cb_eval;
-        params.cb_eval_user_data = callback_data;
+
+        if let Some(kv) = kv_quant {
+            let ggml_type = match kv {
+                KvQuantization::F16 => hypura_sys::ggml_type_GGML_TYPE_F16,
+                KvQuantization::Q8_0 => hypura_sys::ggml_type_GGML_TYPE_Q8_0,
+                KvQuantization::Q4_0 => hypura_sys::ggml_type_GGML_TYPE_Q4_0,
+            };
+            params.type_k = ggml_type;
+            params.type_v = ggml_type;
+            tracing::info!("KV cache quantization: {:?}", kv);
+        }
+
+        if cb_eval.is_some() {
+            params.cb_eval = cb_eval;
+            params.cb_eval_user_data = callback_data;
+        }
 
         let ptr = unsafe { hypura_sys::llama_init_from_model(model.as_ptr(), params) };
-        anyhow::ensure!(!ptr.is_null(), "Failed to create llama context with callback");
+        anyhow::ensure!(!ptr.is_null(), "Failed to create llama context");
 
         Ok(Self { ptr })
     }

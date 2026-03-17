@@ -39,7 +39,7 @@ enum Commands {
         #[arg(long, default_value = "512")]
         max_tokens: u32,
     },
-    /// Start OpenAI-compatible API server
+    /// Start Ollama-compatible API server
     Serve {
         /// Path to model file
         model: String,
@@ -49,6 +49,9 @@ enum Commands {
         /// Port to bind to
         #[arg(long, default_value = "8080")]
         port: u16,
+        /// Maximum context length
+        #[arg(long, default_value = "4096")]
+        context: u32,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -66,6 +69,9 @@ enum Commands {
         /// Prompt text
         #[arg(long)]
         prompt: Option<String>,
+        /// Force unsafe operations (e.g. baseline with model larger than RAM)
+        #[arg(long)]
+        force: bool,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -102,14 +108,15 @@ fn main() -> anyhow::Result<()> {
             interactive,
             max_tokens,
         } => cli::run::run(&model, context, prompt.as_deref(), interactive, max_tokens),
-        Commands::Serve { model, host, port } => cli::serve::run(&model, &host, port),
+        Commands::Serve { model, host, port, context } => cli::serve::run(&model, &host, port, context),
         Commands::Bench {
             model,
             baseline,
             context,
             max_tokens,
             prompt,
-        } => cli::bench::run(&model, baseline, context, max_tokens, prompt.as_deref()),
+            force,
+        } => cli::bench::run(&model, baseline, context, max_tokens, prompt.as_deref(), force),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
         Commands::Optimize { model } => cli::optimize::run(&model),
     }

@@ -84,6 +84,25 @@ pub struct PrefetchOp {
     pub lead_time_layers: u32,
 }
 
+/// KV cache quantization type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KvQuantization {
+    F16,
+    Q8_0,
+    Q4_0,
+}
+
+impl KvQuantization {
+    /// Memory scale factor relative to F16.
+    pub fn memory_scale(&self) -> f64 {
+        match self {
+            Self::F16 => 1.0,
+            Self::Q8_0 => 0.53,
+            Self::Q4_0 => 0.28,
+        }
+    }
+}
+
 /// Plan for KV cache allocation across tiers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvCachePlan {
@@ -93,6 +112,8 @@ pub struct KvCachePlan {
     pub warm_tier: StorageTier,
     pub hot_bytes: u64,
     pub warm_bytes: u64,
+    /// Auto-selected KV quantization (None = F16 default).
+    pub kv_quantization: Option<KvQuantization>,
 }
 
 /// Summary of placement for display.

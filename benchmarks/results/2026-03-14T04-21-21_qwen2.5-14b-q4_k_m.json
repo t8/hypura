@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-03-14T04:21:21.108779+00:00",
+  "model": {
+    "name": "qwen2.5-14b-q4_k_m",
+    "architecture": "qwen2",
+    "params": "14.8B",
+    "quant": "Q4K",
+    "size_gb": 8.365272521972656
+  },
+  "hardware": {
+    "cpu": "Apple M1 Max",
+    "ram_gb": 32.0,
+    "gpu": "Apple M1 Max",
+    "nvme_seq_gbps": 5.093685141
+  },
+  "placement": {
+    "gpu_gb": 8.365272521972656,
+    "ram_gb": 0.0,
+    "nvme_gb": 0.0
+  },
+  "config": {
+    "context": 2048,
+    "max_tokens": 64,
+    "prompt": "Write a short paragraph about artificial intelligence.",
+    "n_gpu_layers": 49
+  },
+  "baseline": null,
+  "hypura": {
+    "prompt_eval_ms": 107.37112499999999,
+    "tok_per_sec": 24.00942707645319,
+    "tokens_generated": 64,
+    "wall_time_ms": 6668.94325
+  },
+  "speedup": null
+}

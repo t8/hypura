@@ -2,10 +2,15 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
+use crate::cache::coactivation::CoActivationMatrix;
+use crate::cache::neuron_cache::NeuronCache;
+use crate::io::expert_layout::{ExpertLayout, ExpertTensorType};
 use crate::model::gguf::GgufFile;
+use crate::model::tensor_role::TensorRole;
 use crate::scheduler::types::*;
 
 /// Metadata about a tensor in our custom buffer.
@@ -23,6 +28,200 @@ pub enum LayerStatus {
     NotLoaded,
     Loading,
     Loaded,
+}
+
+/// Message types for prefetch requests (high-level API).
+pub enum PrefetchRequest {
+    /// Load an entire layer's data from NVMe.
+    Layer(u32),
+    /// Load specific expert slices for a layer (speculative prefetch).
+    ExpertSlices {
+        layer_idx: u32,
+        expert_ids: Vec<u32>,
+    },
+}
+
+// --- I/O Pool types (Phase 1) ---
+
+/// A single unit of I/O work for the pool workers.
+struct IoPoolTask {
+    /// Regions to pread: (buffer_offset, size, file_offset)
+    regions: Vec<(usize, usize, u64)>,
+    /// Buffer base pointer
+    base: *mut u8,
+    /// Shared completion tracking
+    completion: Arc<IoCompletion>,
+}
+
+// SAFETY: base pointer is a stable posix_memalign allocation shared via IoPool protocol.
+// Workers write to non-overlapping regions guaranteed by LoadUnit decomposition.
+unsafe impl Send for IoPoolTask {}
+
+/// Tracks completion of a multi-unit layer load.
+struct IoCompletion {
+    /// Number of remaining tasks. When 0, all tasks are complete.
+    remaining: AtomicUsize,
+    /// Which layer this load is for.
+    layer_idx: u32,
+    /// Whether to update LayerStatus::Loaded on completion.
+    update_status: bool,
+}
+
+/// Multi-threaded I/O pool for NVMe reads. Manages worker threads,
+/// each with its own F_NOCACHE fd to the model file.
+pub struct IoPool {
+    /// Channel for submitting tasks (None when pool is stopping).
+    tx: Option<std::sync::mpsc::Sender<IoPoolTask>>,
+    /// Worker thread handles.
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Per-worker file descriptors (for cleanup).
+    worker_fds: Vec<i32>,
+    /// Throughput tracking: total bytes loaded by all workers.
+    pub bytes_loaded: Arc<AtomicU64>,
+    /// Throughput tracking: total load time in nanoseconds.
+    pub load_time_ns: Arc<AtomicU64>,
+}
+
+impl IoPool {
+    fn new(
+        model_path: &Path,
+        num_workers: usize,
+        state: Arc<PrefetchState>,
+    ) -> anyhow::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<IoPoolTask>();
+        let rx = Arc::new(Mutex::new(rx));
+
+        let bytes_loaded = Arc::new(AtomicU64::new(0));
+        let load_time_ns = Arc::new(AtomicU64::new(0));
+
+        let mut worker_fds = Vec::with_capacity(num_workers);
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for i in 0..num_workers {
+            let file = std::fs::File::open(model_path)?;
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::fcntl(fd, libc::F_NOCACHE, 1);
+            }
+            std::mem::forget(file);
+            worker_fds.push(fd);
+
+            let rx = rx.clone();
+            let state = state.clone();
+            let bytes_loaded = bytes_loaded.clone();
+            let load_time_ns = load_time_ns.clone();
+
+            let handle = std::thread::Builder::new()
+                .name(format!("hypura-io-{i}"))
+                .spawn(move || io_worker(fd, rx, state, bytes_loaded, load_time_ns))
+                .expect("failed to spawn I/O worker");
+            handles.push(handle);
+        }
+
+        tracing::info!("I/O pool started: {} workers", num_workers);
+
+        Ok(Self {
+            tx: Some(tx),
+            handles,
+            worker_fds,
+            bytes_loaded,
+            load_time_ns,
+        })
+    }
+
+    pub fn num_workers(&self) -> usize {
+        self.worker_fds.len()
+    }
+
+    /// Measured throughput in bytes per second.
+    pub fn throughput_bps(&self) -> f64 {
+        let bytes = self.bytes_loaded.load(Ordering::Relaxed) as f64;
+        let ns = self.load_time_ns.load(Ordering::Relaxed) as f64;
+        if ns > 0.0 {
+            bytes / (ns / 1e9)
+        } else {
+            0.0
+        }
+    }
+}
+
+impl Drop for IoPool {
+    fn drop(&mut self) {
+        // Close channel to signal workers to exit
+        self.tx.take();
+
+        // Wait for workers to finish
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+
+        // Close per-worker fds
+        for fd in &self.worker_fds {
+            unsafe {
+                libc::close(*fd);
+            }
+        }
+    }
+}
+
+/// I/O worker thread: pulls tasks from shared channel, executes pread.
+fn io_worker(
+    fd: i32,
+    rx: Arc<Mutex<std::sync::mpsc::Receiver<IoPoolTask>>>,
+    state: Arc<PrefetchState>,
+    bytes_loaded: Arc<AtomicU64>,
+    load_time_ns: Arc<AtomicU64>,
+) {
+    loop {
+        let task = {
+            let rx = rx.lock().unwrap();
+            match rx.recv() {
+                Ok(task) => task,
+                Err(_) => return, // Channel closed
+            }
+        };
+
+        let start = Instant::now();
+        let mut total = 0u64;
+
+        for &(offset, size, file_offset) in &task.regions {
+            pread_region(fd, task.base, offset, size, file_offset);
+            total += size as u64;
+        }
+
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        bytes_loaded.fetch_add(total, Ordering::Relaxed);
+        load_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        // Decrement completion counter
+        let prev = task.completion.remaining.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 && task.completion.update_status {
+            // Last task for this layer — mark complete
+            let mut status = state.layer_status.lock().unwrap();
+            status.insert(task.completion.layer_idx, LayerStatus::Loaded);
+            state.layer_notify.notify_all();
+        }
+    }
+}
+
+/// Perform pread I/O for a single region. Standalone function used by IoPool workers.
+fn pread_region(fd: i32, base: *mut u8, offset: usize, size: usize, file_offset: u64) {
+    let dst = unsafe { base.add(offset) };
+    let mut read = 0usize;
+    while read < size {
+        let n = unsafe {
+            libc::pread(
+                fd,
+                dst.add(read) as *mut c_void,
+                size - read,
+                (file_offset + read as u64) as libc::off_t,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        read += n as usize;
+    }
 }
 
 /// Shared state between the eval callback and the inference engine.
@@ -43,91 +242,256 @@ pub struct PrefetchState {
     pub num_layers: u32,
     /// Whether prefetch is enabled
     pub prefetch_enabled: AtomicBool,
-    /// File descriptor for F_NOCACHE reads (opened once, reused)
-    pub nvme_fd: Mutex<Option<i32>>,
-    /// Channel sender for background prefetch thread
-    pub prefetch_tx: Mutex<Option<std::sync::mpsc::Sender<u32>>>,
+    /// Multi-threaded I/O pool (replaces single prefetch thread + nvme_fd)
+    pub io_pool: Mutex<Option<IoPool>>,
     /// Layer indices that are on NVMe (released after use, re-loaded as needed).
-    /// Layers in our buffer but NOT in this set are RAM layers (loaded once, kept).
     pub nvme_layers: std::collections::HashSet<u32>,
+    /// When true, NVMe layers are kept in physical memory after first load
+    pub keep_nvme_resident: AtomicBool,
+    /// NVMe layer indices sorted ascending for sequential prefetch ordering.
+    pub sorted_nvme_layers: Vec<u32>,
+
+    // --- Expert-level data structures ---
+
+    /// Per-layer expert tensor layouts for fused expert tensors.
+    pub expert_layouts: HashMap<u32, Vec<ExpertLayout>>,
+    /// Per-layer non-expert tensor regions (norms, router weights, etc.).
+    pub non_expert_regions: HashMap<u32, Vec<(usize, usize, u64)>>,
+
+    // --- Router interception ---
+
+    /// Per-layer expert selection from the most recent router output.
+    pub selected_experts: Mutex<HashMap<u32, Vec<u32>>>,
+    pub num_experts_used: u32,
+    pub num_experts_total: u32,
+
+    // --- Neuron cache ---
+
+    pub neuron_cache: Mutex<NeuronCache>,
+    pub debug_logged_tensors: AtomicI32,
+
+    // --- Co-activation tracking (Phase 2) ---
+
+    pub co_activation: Mutex<CoActivationMatrix>,
+    /// Previous layer expert selections for cross-layer tracking.
+    pub prev_layer_experts: Mutex<Option<(u32, Vec<u32>)>>,
 }
 
-// SAFETY: buffer_base and nvme_fd are accessed under Mutex
+// SAFETY: buffer_base accessed under Mutex; raw pointers managed by IoPool protocol
 unsafe impl Send for PrefetchState {}
 unsafe impl Sync for PrefetchState {}
 
 impl PrefetchState {
-    /// Open the model file with F_NOCACHE for direct NVMe reads.
-    pub fn open_nvme_fd(&self) -> anyhow::Result<()> {
-        let file = std::fs::File::open(&self.model_path)?;
-        let fd = file.as_raw_fd();
-        unsafe {
-            libc::fcntl(fd, libc::F_NOCACHE, 1);
+    /// Submit a layer load to the I/O pool. Decomposes into tasks based on
+    /// expert-aware loading when router selections are available.
+    fn submit_layer_load(&self, layer_idx: u32) {
+        let base = *self.buffer_base.lock().unwrap();
+        if base.is_null() {
+            return;
         }
-        // Prevent the file from being closed when `file` drops
-        std::mem::forget(file);
-        *self.nvme_fd.lock().unwrap() = Some(fd);
-        Ok(())
+
+        let maybe_experts = self
+            .selected_experts
+            .lock()
+            .unwrap()
+            .get(&layer_idx)
+            .cloned();
+        let has_expert_layouts = self.expert_layouts.contains_key(&layer_idx);
+
+        let mut task_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
+
+        if let (Some(ref experts), true) = (&maybe_experts, has_expert_layouts) {
+            tracing::trace!(
+                "Expert-aware load: layer {} experts {:?}",
+                layer_idx,
+                experts
+            );
+
+            // Non-expert regions as one task
+            if let Some(regions) = self.non_expert_regions.get(&layer_idx) {
+                if !regions.is_empty() {
+                    task_regions.push(regions.clone());
+                }
+            }
+
+            // Each fused expert tensor as a separate task
+            let mut cache = self.neuron_cache.lock().unwrap();
+            if let Some(layouts) = self.expert_layouts.get(&layer_idx) {
+                for layout in layouts {
+                    let tensor_type = ExpertTensorType::from_name(&layout.tensor_name)
+                        .unwrap_or(ExpertTensorType::Gate);
+                    let mut regions = Vec::new();
+                    for &eid in experts {
+                        if eid >= layout.num_experts {
+                            continue;
+                        }
+                        if cache.is_loaded(layer_idx, eid, tensor_type) {
+                            continue;
+                        }
+                        regions.push((
+                            layout.expert_buffer_offset(eid),
+                            layout.expert_stride,
+                            layout.expert_file_offset(eid),
+                        ));
+                        cache.mark_loaded(layer_idx, eid, tensor_type);
+                    }
+                    if !regions.is_empty() {
+                        task_regions.push(regions);
+                    }
+                }
+            }
+        } else {
+            // Full layer load — split regions across workers for parallel I/O.
+            // Each worker reads different file offsets concurrently, which saturates
+            // the NVMe controller better than a single sequential reader.
+            if let Some(regions) = self.layer_regions.get(&layer_idx) {
+                if !regions.is_empty() {
+                    let num_workers = self
+                        .io_pool
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(1, |p| p.num_workers().max(1));
+                    let chunk_size = (regions.len() + num_workers - 1) / num_workers;
+                    for chunk in regions.chunks(chunk_size) {
+                        task_regions.push(chunk.to_vec());
+                    }
+                }
+            }
+        }
+
+        if task_regions.is_empty() {
+            // Nothing to load — mark as Loaded immediately
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loaded);
+            self.layer_notify.notify_all();
+            return;
+        }
+
+        let completion = Arc::new(IoCompletion {
+            remaining: AtomicUsize::new(task_regions.len()),
+            layer_idx,
+            update_status: true,
+        });
+
+        let pool = self.io_pool.lock().unwrap();
+        if let Some(ref pool) = *pool {
+            if let Some(ref tx) = pool.tx {
+                for regions in task_regions {
+                    let _ = tx.send(IoPoolTask {
+                        regions,
+                        base,
+                        completion: completion.clone(),
+                    });
+                }
+            }
+        } else {
+            // No pool — mark as Loaded to avoid deadlock
+            tracing::warn!("IoPool not started, cannot load layer {}", layer_idx);
+            drop(pool);
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loaded);
+            self.layer_notify.notify_all();
+        }
     }
 
-    /// Perform the raw pread I/O for a layer's tensor regions.
-    fn load_layer_data(&self, layer_idx: u32) {
-        let regions = match self.layer_regions.get(&layer_idx) {
-            Some(r) => r,
-            None => return,
-        };
+    /// Submit expert-only loads for speculative prefetch (no layer status change).
+    fn submit_expert_load(&self, layer_idx: u32, expert_ids: &[u32]) {
+        if !self.expert_layouts.contains_key(&layer_idx) {
+            return;
+        }
 
         let base = *self.buffer_base.lock().unwrap();
         if base.is_null() {
             return;
         }
 
-        let fd = match *self.nvme_fd.lock().unwrap() {
-            Some(fd) => fd,
-            None => return,
-        };
+        let mut task_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
 
-        for &(offset, size, file_offset) in regions {
-            let dst = unsafe { base.add(offset) };
-            let mut read = 0usize;
-            while read < size {
-                let n = unsafe {
-                    libc::pread(
-                        fd,
-                        dst.add(read) as *mut c_void,
-                        size - read,
-                        (file_offset + read as u64) as libc::off_t,
-                    )
-                };
-                if n <= 0 {
-                    break;
+        // Non-expert regions
+        if let Some(regions) = self.non_expert_regions.get(&layer_idx) {
+            if !regions.is_empty() {
+                task_regions.push(regions.clone());
+            }
+        }
+
+        // Expert strides
+        {
+            let mut cache = self.neuron_cache.lock().unwrap();
+            if let Some(layouts) = self.expert_layouts.get(&layer_idx) {
+                for layout in layouts {
+                    let tensor_type = ExpertTensorType::from_name(&layout.tensor_name)
+                        .unwrap_or(ExpertTensorType::Gate);
+                    let mut regions = Vec::new();
+                    for &eid in expert_ids {
+                        if eid >= layout.num_experts {
+                            continue;
+                        }
+                        if cache.is_loaded(layer_idx, eid, tensor_type) {
+                            continue;
+                        }
+                        regions.push((
+                            layout.expert_buffer_offset(eid),
+                            layout.expert_stride,
+                            layout.expert_file_offset(eid),
+                        ));
+                        cache.mark_loaded(layer_idx, eid, tensor_type);
+                    }
+                    if !regions.is_empty() {
+                        task_regions.push(regions);
+                    }
                 }
-                read += n as usize;
+            }
+        }
+
+        if task_regions.is_empty() {
+            return;
+        }
+
+        // Expert-only loads don't update layer status
+        let completion = Arc::new(IoCompletion {
+            remaining: AtomicUsize::new(task_regions.len()),
+            layer_idx,
+            update_status: false,
+        });
+
+        let pool = self.io_pool.lock().unwrap();
+        if let Some(ref pool) = *pool {
+            if let Some(ref tx) = pool.tx {
+                for regions in task_regions {
+                    let _ = tx.send(IoPoolTask {
+                        regions,
+                        base,
+                        completion: completion.clone(),
+                    });
+                }
             }
         }
     }
 
     /// Ensure a layer's tensor data is loaded in physical memory.
-    /// Blocks until loaded — waits on background thread or does synchronous pread fallback.
+    /// Submits to the I/O pool and waits for completion.
     pub fn ensure_layer_loaded(&self, layer_idx: u32) {
         let mut status = self.layer_status.lock().unwrap();
         loop {
             match status.get(&layer_idx).copied() {
                 Some(LayerStatus::Loaded) => return,
                 Some(LayerStatus::Loading) => {
-                    // Background thread is loading — wait for completion
+                    // I/O pool or another thread is loading — wait
                     status = self.layer_notify.wait(status).unwrap();
                 }
                 _ => {
-                    // Not loaded — synchronous fallback
+                    // Not loaded — submit to I/O pool and wait
                     status.insert(layer_idx, LayerStatus::Loading);
                     drop(status);
 
-                    self.load_layer_data(layer_idx);
+                    self.submit_layer_load(layer_idx);
 
+                    // Wait for completion (pool workers set Loaded + notify)
                     let mut status = self.layer_status.lock().unwrap();
-                    status.insert(layer_idx, LayerStatus::Loaded);
-                    self.layer_notify.notify_all();
+                    while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
+                        status = self.layer_notify.wait(status).unwrap();
+                    }
                     return;
                 }
             }
@@ -135,7 +499,6 @@ impl PrefetchState {
     }
 
     /// Release physical pages for a layer's tensors.
-    /// Virtual address space is preserved; data must be reloaded before next use.
     pub fn release_layer(&self, layer_idx: u32) {
         let regions = match self.layer_regions.get(&layer_idx) {
             Some(r) => r,
@@ -154,63 +517,133 @@ impl PrefetchState {
             }
         }
 
+        // Invalidate neuron cache entries for this layer
+        self.neuron_cache.lock().unwrap().evict_layer(layer_idx);
+
         self.layer_status
             .lock()
             .unwrap()
             .insert(layer_idx, LayerStatus::NotLoaded);
     }
 
-    /// Send a non-blocking prefetch request to the background thread.
-    pub fn request_prefetch(&self, layer_idx: u32) {
-        if let Some(tx) = self.prefetch_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(layer_idx);
+    /// Pre-load all RAM-tier layers via the I/O pool.
+    pub fn preload_ram_layers(&self) {
+        let ram_layers: Vec<u32> = self
+            .layer_regions
+            .keys()
+            .filter(|l| !self.nvme_layers.contains(l))
+            .copied()
+            .collect();
+
+        if ram_layers.is_empty() {
+            return;
+        }
+        tracing::info!("Pre-loading {} RAM-tier layers", ram_layers.len());
+
+        // Submit all layers to pool
+        for &layer_idx in &ram_layers {
+            self.request_prefetch(PrefetchRequest::Layer(layer_idx));
+        }
+
+        // Wait for all to complete
+        for &layer_idx in &ram_layers {
+            let mut status = self.layer_status.lock().unwrap();
+            while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
+                status = self.layer_notify.wait(status).unwrap();
+            }
         }
     }
 
-    /// Spawn the background prefetch thread. Returns JoinHandle.
-    pub fn start_prefetch_thread(self: &Arc<Self>) -> Option<std::thread::JoinHandle<()>> {
-        let (tx, rx) = std::sync::mpsc::channel::<u32>();
-        *self.prefetch_tx.lock().unwrap() = Some(tx);
-
-        let state = self.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("hypura-prefetch".into())
-                .spawn(move || prefetch_worker(&state, rx))
-                .expect("failed to spawn prefetch thread"),
-        )
-    }
-
-    /// Stop the background prefetch thread by dropping the sender.
-    pub fn stop_prefetch_thread(&self) {
-        self.prefetch_tx.lock().unwrap().take();
-    }
-}
-
-/// Background prefetch worker: receives layer indices, preloads data from NVMe.
-fn prefetch_worker(state: &PrefetchState, rx: std::sync::mpsc::Receiver<u32>) {
-    while let Ok(layer_idx) = rx.recv() {
-        let mut status = state.layer_status.lock().unwrap();
-        match status.get(&layer_idx).copied() {
-            Some(LayerStatus::Loaded) | Some(LayerStatus::Loading) => continue,
-            _ => {}
+    /// Request prefetch for all NVMe layers (sorted for sequential I/O).
+    pub fn prefetch_all_nvme(&self) {
+        for &layer in &self.sorted_nvme_layers {
+            self.request_prefetch(PrefetchRequest::Layer(layer));
         }
-        status.insert(layer_idx, LayerStatus::Loading);
-        drop(status);
+    }
 
-        state.load_layer_data(layer_idx);
+    /// Send a non-blocking prefetch request to the I/O pool.
+    pub fn request_prefetch(&self, request: PrefetchRequest) {
+        match request {
+            PrefetchRequest::Layer(layer_idx) => {
+                let mut status = self.layer_status.lock().unwrap();
+                match status.get(&layer_idx).copied() {
+                    Some(LayerStatus::Loaded) | Some(LayerStatus::Loading) => return,
+                    _ => {}
+                }
+                status.insert(layer_idx, LayerStatus::Loading);
+                drop(status);
+                self.submit_layer_load(layer_idx);
+            }
+            PrefetchRequest::ExpertSlices {
+                layer_idx,
+                expert_ids,
+            } => {
+                self.submit_expert_load(layer_idx, &expert_ids);
+            }
+        }
+    }
 
-        let mut status = state.layer_status.lock().unwrap();
-        status.insert(layer_idx, LayerStatus::Loaded);
-        state.layer_notify.notify_all();
+    /// Start the multi-threaded I/O pool.
+    pub fn start_io_pool(self: &Arc<Self>, num_workers: usize) -> anyhow::Result<()> {
+        let pool = IoPool::new(&self.model_path, num_workers, self.clone())?;
+        *self.io_pool.lock().unwrap() = Some(pool);
+        Ok(())
+    }
+
+    /// Stop the I/O pool and wait for workers to finish.
+    pub fn stop_io_pool(&self) {
+        // Take the pool — IoPool::drop closes channel, joins workers, closes fds
+        self.io_pool.lock().unwrap().take();
+    }
+
+    /// Compute adaptive prefetch lookahead based on measured I/O throughput.
+    fn adaptive_lookahead(&self) -> u32 {
+        let pool = self.io_pool.lock().unwrap();
+        let throughput = pool.as_ref().map_or(3e9, |p| {
+            let t = p.throughput_bps();
+            if t > 0.0 {
+                t
+            } else {
+                3e9 // Default 3 GB/s
+            }
+        });
+        drop(pool);
+
+        if self.sorted_nvme_layers.is_empty() {
+            return 4;
+        }
+
+        let avg_layer_bytes: u64 = self
+            .sorted_nvme_layers
+            .iter()
+            .filter_map(|l| self.layer_regions.get(l))
+            .map(|regions| regions.iter().map(|r| r.1 as u64).sum::<u64>())
+            .sum::<u64>()
+            .checked_div(self.sorted_nvme_layers.len() as u64)
+            .unwrap_or(0);
+
+        if avg_layer_bytes == 0 {
+            return 4;
+        }
+
+        // Conservative: assume 100ms compute per layer
+        let compute_time_secs = 0.1;
+        let loadable_per_compute = throughput * compute_time_secs;
+        let needed = (avg_layer_bytes as f64 / loadable_per_compute).ceil() as u32;
+        needed.clamp(2, 8)
     }
 }
 
 impl Drop for PrefetchState {
     fn drop(&mut self) {
-        if let Some(fd) = self.nvme_fd.lock().unwrap().take() {
-            unsafe {
-                libc::close(fd);
+        // Save co-activation data on shutdown
+        let co_activation = self.co_activation.lock().unwrap();
+        if co_activation.has_data() {
+            let path = CoActivationMatrix::persistence_path(&self.model_path);
+            if let Err(e) = co_activation.save(&path) {
+                tracing::warn!("Failed to save co-activation data: {e}");
+            } else {
+                tracing::info!("Co-activation data saved to {}", path.display());
             }
         }
     }
@@ -288,15 +721,136 @@ impl HypuraBuftController {
             }
         }
 
-        // All layers start as NotLoaded — data loaded lazily via pread
-        // (set_tensor skips memcpy to avoid peak memory during model loading)
+        // Sort regions within each layer by file offset for sequential I/O
+        for regions in layer_regions.values_mut() {
+            regions.sort_by_key(|&(_, _, file_offset)| file_offset);
+        }
+
+        // --- Build expert layouts and non-expert region maps ---
+        let mut expert_layouts: HashMap<u32, Vec<ExpertLayout>> = HashMap::new();
+        let mut non_expert_regions: HashMap<u32, Vec<(usize, usize, u64)>> = HashMap::new();
+
+        let num_experts_total = gguf.get_u32("expert_count").unwrap_or(0);
+        let num_experts_used = gguf.get_u32("expert_used_count").unwrap_or(0);
+
+        // Try to load expert permutations from sidecar file
+        let perm_path = self.model_path.with_extension("permutations.json");
+        let permutations: HashMap<u32, Vec<u32>> = if perm_path.exists() {
+            match std::fs::read_to_string(&perm_path) {
+                Ok(json) => {
+                    let forward: HashMap<u32, Vec<u32>> =
+                        serde_json::from_str(&json).unwrap_or_default();
+                    if !forward.is_empty() {
+                        tracing::info!(
+                            "Loaded expert permutations from {}",
+                            perm_path.display()
+                        );
+                    }
+                    // Invert: forward[phys_pos] = logical_id → inverse[logical_id] = phys_pos
+                    forward
+                        .into_iter()
+                        .map(|(layer, fwd)| {
+                            let mut inv = vec![0u32; fwd.len()];
+                            for (phys, &logical) in fwd.iter().enumerate() {
+                                if (logical as usize) < inv.len() {
+                                    inv[logical as usize] = phys as u32;
+                                }
+                            }
+                            (layer, inv)
+                        })
+                        .collect()
+                }
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+
+        for tensor_info in &gguf.tensors {
+            let layer_idx = match tensor_info.layer_index {
+                Some(l) => l,
+                None => continue,
+            };
+
+            let loc = match map.get(&tensor_info.name) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            let role = TensorRole::from_name(&tensor_info.name);
+
+            match role {
+                TensorRole::MoeFusedExperts if num_experts_total > 0 => {
+                    let expert_stride = loc.size / num_experts_total as usize;
+                    expert_layouts.entry(layer_idx).or_default().push(ExpertLayout {
+                        tensor_name: tensor_info.name.clone(),
+                        layer_index: layer_idx,
+                        num_experts: num_experts_total,
+                        expert_stride,
+                        file_offset: loc.file_offset,
+                        buffer_offset: loc.offset_in_buffer,
+                        total_size: loc.size,
+                        expert_permutation: permutations.get(&layer_idx).cloned(),
+                    });
+                }
+                _ => {
+                    non_expert_regions
+                        .entry(layer_idx)
+                        .or_default()
+                        .push((loc.offset_in_buffer, loc.size, loc.file_offset));
+                }
+            }
+        }
+
+        non_expert_regions.retain(|layer, _| expert_layouts.contains_key(layer));
+
+        for regions in non_expert_regions.values_mut() {
+            regions.sort_by_key(|&(_, _, file_offset)| file_offset);
+        }
+
+        if !expert_layouts.is_empty() {
+            let total_expert_tensors: usize = expert_layouts.values().map(|v| v.len()).sum();
+            tracing::info!(
+                "MoE expert layouts: {} fused tensors across {} layers ({} experts, {} used/token)",
+                total_expert_tensors,
+                expert_layouts.len(),
+                num_experts_total,
+                num_experts_used,
+            );
+        }
+
         let layer_status: HashMap<u32, LayerStatus> = layer_regions
             .keys()
             .map(|&k| (k, LayerStatus::NotLoaded))
             .collect();
 
-        // Copy buffer_base from controller (set during model loading callbacks)
         let buffer_base = *self.buffer_base.lock().unwrap();
+
+        let mut sorted_nvme_layers: Vec<u32> = nvme_layers.iter().copied().collect();
+        sorted_nvme_layers.sort();
+
+        let moe_nvme_layer_count = sorted_nvme_layers
+            .iter()
+            .filter(|l| expert_layouts.contains_key(l))
+            .count();
+        let expert_tensor_types = 3;
+        let hot_experts = 3;
+        let cache_capacity = moe_nvme_layer_count * expert_tensor_types * hot_experts;
+        let cache_capacity = cache_capacity.max(16);
+
+        // Load or create co-activation matrix
+        let co_activation = if num_experts_total > 0 {
+            let co_path = CoActivationMatrix::persistence_path(&self.model_path);
+            match CoActivationMatrix::load(&co_path) {
+                Ok(matrix) => {
+                    tracing::info!("Loaded co-activation data from {}", co_path.display());
+                    matrix
+                }
+                Err(_) => CoActivationMatrix::new(num_layers, num_experts_total),
+            }
+        } else {
+            CoActivationMatrix::new(num_layers, num_experts_total.max(1))
+        };
 
         Arc::new(PrefetchState {
             current_layer: AtomicI32::new(-1),
@@ -308,9 +862,19 @@ impl HypuraBuftController {
             layer_notify: Condvar::new(),
             num_layers,
             prefetch_enabled: AtomicBool::new(true),
-            nvme_fd: Mutex::new(None),
-            prefetch_tx: Mutex::new(None),
+            io_pool: Mutex::new(None),
             nvme_layers,
+            keep_nvme_resident: AtomicBool::new(false),
+            sorted_nvme_layers,
+            expert_layouts,
+            non_expert_regions,
+            selected_experts: Mutex::new(HashMap::new()),
+            num_experts_used,
+            num_experts_total,
+            neuron_cache: Mutex::new(NeuronCache::new(cache_capacity)),
+            debug_logged_tensors: AtomicI32::new(0),
+            co_activation: Mutex::new(co_activation),
+            prev_layer_experts: Mutex::new(None),
         })
     }
 
@@ -329,44 +893,38 @@ impl Drop for HypuraBuftController {
 
 /// Build `tensor_buft_overrides` patterns from a PlacementPlan.
 pub fn build_override_patterns(
-    plan: &PlacementPlan,
+    _plan: &PlacementPlan,
     gguf: &GgufFile,
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
     n_gpu_layers: i32,
 ) -> (Vec<CString>, Vec<hypura_sys::llama_model_tensor_buft_override>) {
-    // Only override tensors in layers BEYOND n_gpu_layers. GPU-offloaded layers
-    // must stay on Metal shared buffers (mmap). Overriding GPU-layer tensors
-    // causes Metal OOM because llama.cpp allocates Metal buffers for them anyway.
     let first_non_gpu_layer = if n_gpu_layers > 0 {
         (n_gpu_layers - 1) as u32
     } else {
         0
     };
 
-    // Count non-GPU-layer tensors per layer (for pattern optimization)
     let mut layer_counts: HashMap<u32, (usize, usize)> = HashMap::new();
 
     for t in &gguf.tensors {
         if let Some(layer) = t.layer_index {
             if layer < first_non_gpu_layer {
-                continue; // GPU-offloaded layer, don't touch
+                continue;
             }
             let entry = layer_counts.entry(layer).or_insert((0, 0));
             entry.1 += 1;
-            entry.0 += 1; // All tensors in non-GPU layers go to our buffer
+            entry.0 += 1;
         }
     }
 
     let mut patterns = Vec::new();
 
-    // Whole-layer pattern for non-GPU layers
     for (layer, (non_gpu, total)) in &layer_counts {
         if *non_gpu == *total && *non_gpu > 0 {
             patterns.push(format!("^blk\\.{}\\.", layer));
         }
     }
 
-    // Per-tensor fallback for partial layers (rare with contiguous assignment)
     for t in &gguf.tensors {
         if let Some(layer) = t.layer_index {
             if layer < first_non_gpu_layer {
@@ -416,11 +974,8 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-/// cb_eval callback — tracks layer transitions and triggers prefetch/release.
-///
-/// When `ask=true` (before computing a tensor): ensure that layer's NVMe data is loaded.
-/// When `ask=false` (after computing): if we've moved to a new layer, release old layer's
-/// pages and request async prefetch for upcoming layers.
+/// cb_eval callback — tracks layer transitions, intercepts router output,
+/// and triggers expert-aware prefetch/release with co-activation predictions.
 pub extern "C" fn eval_callback(
     tensor: *mut hypura_sys::ggml_tensor,
     ask: bool,
@@ -442,38 +997,163 @@ pub extern "C" fn eval_callback(
         Err(_) => return true,
     };
 
-    let layer_idx = match parse_layer_from_name(name_str) {
+    // Router interception — detect ffn_moe_argsort post-compute
+    if !ask && name_str.starts_with("ffn_moe_argsort-") {
+        if let Some(layer_idx) = parse_layer_from_graph_name(name_str) {
+            intercept_router_output(state, tensor, layer_idx);
+        }
+        return true;
+    }
+
+    let layer_idx = match parse_layer_from_graph_name(name_str) {
         Some(l) => l,
-        None => return true,
+        None => match parse_layer_from_name(name_str) {
+            Some(l) => l,
+            None => return true,
+        },
     };
 
+    if !state.layer_regions.contains_key(&layer_idx) {
+        return true;
+    }
+
     if ask {
-        // Before computing: ensure this layer's tensors are in physical memory
         state.ensure_layer_loaded(layer_idx);
     } else {
-        // After computing: track layer transition
         let prev = state.current_layer.swap(layer_idx as i32, Ordering::Relaxed);
         let prev_layer = prev as u32;
 
         if prev >= 0 && prev_layer != layer_idx && prev_layer < layer_idx {
-            // Only release NVMe layers — RAM layers stay in memory
-            if state.nvme_layers.contains(&prev_layer) {
-                state.release_layer(prev_layer);
-            }
+            if state.keep_nvme_resident.load(Ordering::Relaxed) {
+                // Keep-resident mode: no release, no prefetch
+            } else {
+                // Streaming mode: release old NVMe layers, prefetch ahead
+                if state.nvme_layers.contains(&prev_layer) {
+                    state.release_layer(prev_layer);
+                }
 
-            // Async prefetch: only request NVMe layers (RAM layers load once)
-            let target2 = layer_idx + 2;
-            if target2 < state.num_layers && state.nvme_layers.contains(&target2) {
-                state.request_prefetch(target2);
-            }
-            let target3 = layer_idx + 3;
-            if target3 < state.num_layers && state.nvme_layers.contains(&target3) {
-                state.request_prefetch(target3);
+                // Adaptive prefetch lookahead
+                let lookahead_max = state.adaptive_lookahead();
+                for lookahead in 2..=lookahead_max {
+                    let target = layer_idx + lookahead;
+                    if target < state.num_layers && state.nvme_layers.contains(&target) {
+                        state.request_prefetch(PrefetchRequest::Layer(target));
+                    }
+                }
+
+                // Speculative expert prefetch with co-activation predictions
+                if state.expert_layouts.contains_key(&layer_idx) {
+                    if let Some(experts) =
+                        state.selected_experts.lock().unwrap().get(&layer_idx).cloned()
+                    {
+                        // Record in co-activation matrix
+                        state.co_activation.lock().unwrap().record(layer_idx, &experts);
+
+                        // Record cross-layer correlation
+                        {
+                            let mut prev_exp = state.prev_layer_experts.lock().unwrap();
+                            if let Some((prev_l, ref prev_e)) = *prev_exp {
+                                state
+                                    .co_activation
+                                    .lock()
+                                    .unwrap()
+                                    .record_cross_layer(prev_l, prev_e, &experts);
+                            }
+                            *prev_exp = Some((layer_idx, experts.clone()));
+                        }
+
+                        // Use co-activation to predict next layer's experts
+                        let predicted = {
+                            let co_act = state.co_activation.lock().unwrap();
+                            if co_act.has_data() {
+                                co_act.predict_next_layer(layer_idx, &experts, 3)
+                            } else {
+                                experts.clone() // Fallback: same experts
+                            }
+                        };
+
+                        // Union predicted + observed, cap at 4
+                        let mut prefetch_experts = experts;
+                        for p in predicted {
+                            if !prefetch_experts.contains(&p) {
+                                prefetch_experts.push(p);
+                            }
+                        }
+                        prefetch_experts.truncate(4);
+
+                        for lookahead in 1..4 {
+                            let target = layer_idx + lookahead;
+                            if target < state.num_layers
+                                && state.nvme_layers.contains(&target)
+                                && state.expert_layouts.contains_key(&target)
+                            {
+                                state.request_prefetch(PrefetchRequest::ExpertSlices {
+                                    layer_idx: target,
+                                    expert_ids: prefetch_experts.clone(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     true
+}
+
+/// Read selected expert indices from the `ffn_moe_argsort` tensor.
+fn intercept_router_output(
+    state: &PrefetchState,
+    tensor: *mut hypura_sys::ggml_tensor,
+    layer_idx: u32,
+) {
+    let t = unsafe { &*tensor };
+
+    if t.data.is_null() {
+        return;
+    }
+
+    let n_experts = t.ne[0] as usize;
+    let n_tokens = t.ne[1].max(1) as usize;
+    if n_experts == 0 || n_experts > 64 {
+        return;
+    }
+
+    let k = (state.num_experts_used as usize).min(n_experts);
+    if k == 0 {
+        return;
+    }
+
+    let data = t.data as *const i32;
+    let mut expert_ids = Vec::with_capacity(k * n_tokens);
+
+    for token in 0..n_tokens {
+        let row_start = token * n_experts;
+        for i in 0..k {
+            let id = unsafe { *data.add(row_start + i) };
+            if id >= 0 && (id as u32) < state.num_experts_total {
+                expert_ids.push(id as u32);
+            }
+        }
+    }
+
+    if !expert_ids.is_empty() {
+        expert_ids.sort_unstable();
+        expert_ids.dedup();
+        tracing::trace!(
+            "Router intercepted: layer {} experts {:?} (from {} tokens)",
+            layer_idx,
+            expert_ids,
+            n_tokens,
+        );
+        state
+            .selected_experts
+            .lock()
+            .unwrap()
+            .insert(layer_idx, expert_ids);
+    }
 }
 
 fn parse_layer_from_name(name: &str) -> Option<u32> {
@@ -484,6 +1164,12 @@ fn parse_layer_from_name(name: &str) -> Option<u32> {
         }
     }
     None
+}
+
+fn parse_layer_from_graph_name(name: &str) -> Option<u32> {
+    let dash_pos = name.rfind('-')?;
+    let suffix = &name[dash_pos + 1..];
+    suffix.parse().ok()
 }
 
 // C callbacks — signature must match typedef in hypura_buft.h
@@ -516,7 +1202,6 @@ extern "C" fn on_tensor_loaded_cb(
         );
     }
 
-    // Capture buffer_base (same for all tensors in a buffer, set once is sufficient)
     if !buffer_base.is_null() {
         *controller.buffer_base.lock().unwrap() = buffer_base as *mut u8;
     }
@@ -552,21 +1237,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_layer_moe_topk() {
+        assert_eq!(parse_layer_from_name("blk.5.ffn_moe_topk"), Some(5));
+        assert_eq!(parse_layer_from_name("blk.31.ffn_moe_topk"), Some(31));
+    }
+
+    #[test]
     fn test_layer_status_transitions() {
         let status = Mutex::new(HashMap::new());
         let notify = Condvar::new();
 
-        // Initially empty (not tracked)
         assert_eq!(status.lock().unwrap().get(&0), None);
 
-        // Mark as loading
         status.lock().unwrap().insert(0, LayerStatus::Loading);
         assert_eq!(
             status.lock().unwrap().get(&0).copied(),
             Some(LayerStatus::Loading)
         );
 
-        // Mark as loaded
         status.lock().unwrap().insert(0, LayerStatus::Loaded);
         notify.notify_all();
         assert_eq!(
@@ -574,7 +1262,6 @@ mod tests {
             Some(LayerStatus::Loaded)
         );
 
-        // Release
         status.lock().unwrap().insert(0, LayerStatus::NotLoaded);
         assert_eq!(
             status.lock().unwrap().get(&0).copied(),

@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::compute::ffi::*;
+use crate::compute::nvme_backend::{
+    build_override_patterns, eval_callback, HypuraBuftController, PrefetchState,
+};
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::profiler::types::HardwareProfile;
@@ -54,6 +55,317 @@ pub struct GenerationResult {
     pub perf: PerfData,
 }
 
+/// A loaded model that can serve multiple generation requests.
+///
+/// Holds the llama.cpp backend, model, and NVMe scheduling state.
+/// Context + sampler are created fresh per request (cheap to create, expensive to keep).
+pub struct LoadedModel {
+    pub _backend: LlamaBackend,
+    pub model: LlamaModel,
+    pub config: InferenceConfig,
+    pub n_gpu_layers: i32,
+    pub model_name: String,
+    // NVMe scheduling state (None when all tensors fit in GPU+RAM)
+    _controller: Option<Box<HypuraBuftController>>,
+    prefetch_state: Option<Arc<PrefetchState>>,
+    keep_resident: bool,
+}
+
+// SAFETY: All access to LoadedModel is serialized under std::sync::Mutex
+// and only happens from spawn_blocking threads.
+unsafe impl Send for LoadedModel {}
+
+impl Drop for LoadedModel {
+    fn drop(&mut self) {
+        if let Some(ref state) = self.prefetch_state {
+            state.stop_io_pool();
+        }
+    }
+}
+
+/// Parameters for `generate_from_loaded`.
+pub struct GenerateFromLoadedParams<'a> {
+    pub prompt: &'a str,
+    pub sampling: &'a SamplingParams,
+    pub token_tx: mpsc::UnboundedSender<GeneratedToken>,
+    pub telemetry: Arc<TelemetryEmitter>,
+}
+
+/// Load a model once for repeated generation (server use case).
+///
+/// Extracts the model loading logic from `generate_with_nvme_scheduling` so the
+/// heavy work (GGUF parse, placement, buffer setup, model load, prefetch init)
+/// happens once at startup.
+pub fn load_model(
+    model_path: &Path,
+    config: &InferenceConfig,
+    n_gpu_layers: i32,
+    plan: &PlacementPlan,
+    gguf: &GgufFile,
+) -> anyhow::Result<LoadedModel> {
+    let backend = LlamaBackend::init();
+
+    let has_nvme = plan
+        .tier_assignments
+        .values()
+        .any(|t| *t == StorageTier::Nvme);
+
+    // Derive model name from GGUF metadata or filename
+    let model_name = gguf
+        .get_string("general.name")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            model_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".into())
+        });
+
+    if !has_nvme {
+        let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
+        return Ok(LoadedModel {
+            _backend: backend,
+            model,
+            config: config.clone(),
+            n_gpu_layers,
+            model_name,
+            _controller: None,
+            prefetch_state: None,
+            keep_resident: false,
+        });
+    }
+
+    // NVMe path: create custom buffer type
+    let controller = HypuraBuftController::new(model_path, gguf);
+    let (_patterns, overrides) =
+        build_override_patterns(plan, gguf, controller.buft_ptr(), n_gpu_layers);
+
+    let nvme_count = plan
+        .tier_assignments
+        .values()
+        .filter(|t| **t == StorageTier::Nvme)
+        .count();
+    tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
+
+    let model =
+        LlamaModel::load_with_overrides(model_path, n_gpu_layers, true, overrides.as_ptr())?;
+
+    let num_layers = model.n_layers() as u32;
+
+    let nvme_layers: std::collections::HashSet<u32> = gguf
+        .tensors
+        .iter()
+        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .filter_map(|t| t.layer_index)
+        .collect();
+
+    let prefetch_state = controller.build_prefetch_state(gguf, num_layers, nvme_layers);
+
+    // Determine keep-resident mode
+    let total_ram = total_physical_memory();
+    let nvme_bytes: u64 = gguf
+        .tensors
+        .iter()
+        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .map(|t| t.size_bytes)
+        .sum();
+
+    let model_total_bytes = gguf.total_tensor_bytes();
+    let buffer_bytes: u64 = gguf
+        .tensors
+        .iter()
+        .filter(|t| {
+            let tier = plan.tier_assignments.get(&t.name);
+            tier == Some(&StorageTier::Nvme) || tier == Some(&StorageTier::Ram)
+        })
+        .map(|t| t.size_bytes)
+        .sum();
+    let gpu_bytes = model_total_bytes.saturating_sub(buffer_bytes);
+    let gpu_committed_estimate = gpu_bytes * 60 / 100;
+    let runtime_overhead: u64 = 5 * (1 << 29);
+    let estimated_committed = gpu_committed_estimate + buffer_bytes + runtime_overhead;
+    let headroom: u64 = 4 * (1 << 30);
+
+    let keep_resident = nvme_bytes > 0
+        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
+
+    let should_preload = keep_resident
+        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(6 * (1 << 30));
+
+    if keep_resident {
+        tracing::info!(
+            "NVMe keep-resident mode: {:.2} GB NVMe spill, est. committed {:.1}/{:.1} GB",
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+            (estimated_committed + nvme_bytes) as f64 / (1u64 << 30) as f64,
+            total_ram as f64 / (1u64 << 30) as f64,
+        );
+    } else if nvme_bytes > 0 {
+        tracing::info!(
+            "NVMe streaming mode: {:.2} GB NVMe spill",
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+        );
+    }
+    prefetch_state
+        .keep_nvme_resident
+        .store(keep_resident, std::sync::atomic::Ordering::Relaxed);
+
+    // Start multi-threaded I/O pool
+    let num_io_workers = (num_performance_cores() as usize / 2).clamp(2, 4);
+    prefetch_state.start_io_pool(num_io_workers)?;
+
+    if should_preload {
+        prefetch_state.preload_ram_layers();
+    } else if keep_resident {
+        tracing::info!(
+            "Skipping preload: model {:.1} GB exceeds preload threshold (will load lazily)",
+            model_total_bytes as f64 / (1u64 << 30) as f64,
+        );
+    }
+
+    // Initial NVMe prefetch
+    prefetch_state.prefetch_all_nvme();
+
+    if keep_resident {
+        prefetch_state
+            .prefetch_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    Ok(LoadedModel {
+        _backend: backend,
+        model,
+        config: config.clone(),
+        n_gpu_layers,
+        model_name,
+        _controller: Some(controller),
+        prefetch_state: Some(prefetch_state),
+        keep_resident,
+    })
+}
+
+/// Generate text from a pre-loaded model.
+///
+/// Creates a fresh context + sampler per request. The model itself is reused.
+pub fn generate_from_loaded(
+    loaded: &mut LoadedModel,
+    params: GenerateFromLoadedParams<'_>,
+) -> anyhow::Result<GenerationResult> {
+    let GenerateFromLoadedParams {
+        prompt,
+        sampling,
+        token_tx,
+        telemetry,
+    } = params;
+
+    // Build context — with or without NVMe callback
+    let config = &loaded.config;
+    let mut ctx = if let Some(ref prefetch_state) = loaded.prefetch_state {
+        let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
+        let ctx = LlamaContext::new_with_callback(
+            &loaded.model,
+            config.n_ctx,
+            config.n_batch,
+            config.n_threads,
+            Some(eval_callback),
+            state_ptr,
+        )?;
+        // Immediately convert back to avoid leak — the PrefetchState is kept alive
+        // by the Arc in LoadedModel, not by this raw pointer.
+        unsafe {
+            Arc::from_raw(state_ptr as *const PrefetchState);
+        }
+        ctx
+    } else {
+        LlamaContext::new(&loaded.model, config.n_ctx, config.n_batch, config.n_threads)?
+    };
+
+    let mut sampler = LlamaSampler::new(sampling);
+
+    let tokens = loaded.model.tokenize(prompt, true);
+    let prompt_len = tokens.len() as u32;
+    anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
+
+    // Prefetch NVMe layers before prompt eval
+    if let Some(ref state) = loaded.prefetch_state {
+        state.prefetch_all_nvme();
+    }
+
+    // Process prompt
+    let prompt_start = Instant::now();
+    let batch_size = config.n_batch as usize;
+    for chunk in tokens.chunks(batch_size) {
+        ctx.decode(chunk)?;
+    }
+    let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Generation loop
+    let mut generated_text = String::new();
+    let mut n_generated: u32 = 0;
+    let gen_start = Instant::now();
+
+    for _ in 0..sampling.max_tokens {
+        let token_id = sampler.sample(&mut ctx, -1);
+        let is_eog = loaded.model.is_eog(token_id);
+        let piece = loaded.model.token_to_piece(token_id);
+
+        n_generated += 1;
+        generated_text.push_str(&piece);
+
+        let elapsed = gen_start.elapsed().as_secs_f64();
+        let tok_per_sec = if elapsed > 0.0 {
+            n_generated as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        telemetry.emit(TelemetryEvent::TokenGenerated {
+            tok_per_sec,
+            token: piece.clone(),
+        });
+
+        if token_tx
+            .send(GeneratedToken {
+                text: piece,
+                token_id,
+                tok_per_sec,
+                is_eog,
+            })
+            .is_err()
+        {
+            break;
+        }
+
+        if is_eog {
+            break;
+        }
+
+        if !loaded.keep_resident {
+            if let Some(ref state) = loaded.prefetch_state {
+                state.prefetch_all_nvme();
+            }
+        }
+
+        ctx.decode(&[token_id])?;
+    }
+
+    let perf = ctx.perf();
+    let total_gen_time = gen_start.elapsed().as_secs_f64();
+    let avg_tps = if total_gen_time > 0.0 {
+        n_generated as f64 / total_gen_time
+    } else {
+        0.0
+    };
+
+    Ok(GenerationResult {
+        text: generated_text,
+        tokens_generated: n_generated,
+        prompt_tokens: prompt_len,
+        tok_per_sec_avg: avg_tps,
+        prompt_eval_ms: prompt_ms,
+        perf,
+    })
+}
+
 /// Compute GPU budget for model weights (bytes) after reserving space for
 /// KV cache and compute buffers within the Metal working set.
 pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, context_length: u32) -> u64 {
@@ -69,8 +381,8 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
         * head_dim
         * 2
         * context_length as u64;
-    // Reserve 1 GiB for compute buffers + Metal framework overhead
-    let runtime_overhead: u64 = 1 << 30;
+    // Reserve 2 GiB for compute buffers + Metal framework overhead
+    let runtime_overhead: u64 = 2 * (1 << 30);
     gpu_working_set
         .saturating_sub(kv_on_gpu)
         .saturating_sub(runtime_overhead)
@@ -246,10 +558,6 @@ pub fn generate_with_nvme_scheduling(
     token_tx: mpsc::UnboundedSender<GeneratedToken>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<GenerationResult> {
-    use crate::compute::nvme_backend::{
-        build_override_patterns, eval_callback, HypuraBuftController, PrefetchState,
-    };
-
     let _backend = LlamaBackend::init();
 
     // Check if there are any NVMe tensors
@@ -274,14 +582,13 @@ pub fn generate_with_nvme_scheduling(
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
-    // Disable mmap — on Apple Silicon, mmap'd pages in unified memory all count
-    // against Metal's recommendedMaxWorkingSetSize. With mmap off, only GPU-offloaded
-    // layers get Metal shared buffers. CPU_REPACK is disabled in vendored llama.cpp,
-    // so no duplicate copies are created.
+    // Use mmap so GPU-offloaded layers get efficient Metal shared buffers.
+    // Non-GPU tensors are routed to our Hypura buffer via overrides (posix_memalign,
+    // not Metal) so they don't count against recommendedMaxWorkingSetSize.
     let model = LlamaModel::load_with_overrides(
         model_path,
         n_gpu_layers,
-        false,
+        true,
         overrides.as_ptr(),
     )?;
 
@@ -298,11 +605,90 @@ pub fn generate_with_nvme_scheduling(
 
     let prefetch_state = controller.build_prefetch_state(gguf, num_layers, nvme_layers);
 
-    // Open NVMe file descriptor for F_NOCACHE reads during prefetch
-    prefetch_state.open_nvme_fd()?;
+    // Determine if NVMe layers can stay resident in physical memory.
+    // When the NVMe spill is modest relative to total RAM, we keep NVMe-tier data
+    // loaded after the first forward pass — eliminating all NVMe I/O for subsequent
+    // tokens. This is the key optimization for "barely overflows" models like
+    // Mixtral 30.9GB on 32GB: the 2GB NVMe spill stays resident, so only the first
+    // forward pass incurs NVMe I/O.
+    let total_ram = total_physical_memory();
+    let nvme_bytes: u64 = gguf
+        .tensors
+        .iter()
+        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .map(|t| t.size_bytes)
+        .sum();
+    // Keep-resident mode: keep NVMe data loaded after the first forward pass,
+    // eliminating all NVMe I/O for subsequent tokens.
+    //
+    // Estimate actual committed memory: GPU layers via mmap commit ~60% of their
+    // size on Apple Silicon (demand paging), our buffer commits its full allocation,
+    // plus ~2.5 GB for KV cache + Metal overhead.
+    //
+    // Keep-resident when: estimated_committed + nvme_bytes fits in RAM with 4 GB
+    // headroom for page cache. This lets small-spill models (Mixtral 2 GB on 32 GB)
+    // stay resident while large-spill models (Llama 70B, 16 GB NVMe) use streaming.
+    let model_total_bytes = gguf.total_tensor_bytes();
+    let buffer_bytes: u64 = gguf
+        .tensors
+        .iter()
+        .filter(|t| {
+            let tier = plan.tier_assignments.get(&t.name);
+            tier == Some(&StorageTier::Nvme) || tier == Some(&StorageTier::Ram)
+        })
+        .map(|t| t.size_bytes)
+        .sum();
+    let gpu_bytes = model_total_bytes.saturating_sub(buffer_bytes);
+    let gpu_committed_estimate = gpu_bytes * 60 / 100; // ~60% committed via mmap
+    let runtime_overhead: u64 = 5 * (1 << 29); // ~2.5 GB for KV cache + Metal
+    let estimated_committed = gpu_committed_estimate + buffer_bytes + runtime_overhead;
+    let headroom: u64 = 4 * (1 << 30); // 4 GB for page cache + system
 
-    // Start background prefetch thread for async layer preloading
-    let prefetch_handle = prefetch_state.start_prefetch_thread();
+    let keep_resident = nvme_bytes > 0
+        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
+
+    // Preloading is separate: only preload when estimated committed memory
+    // (including all buffer layers pre-loaded) fits with 6 GB headroom.
+    let should_preload = keep_resident
+        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(6 * (1 << 30));
+
+    if keep_resident {
+        tracing::info!(
+            "NVMe keep-resident mode: {:.2} GB NVMe spill, est. committed {:.1}/{:.1} GB",
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+            (estimated_committed + nvme_bytes) as f64 / (1u64 << 30) as f64,
+            total_ram as f64 / (1u64 << 30) as f64,
+        );
+    } else if nvme_bytes > 0 {
+        tracing::info!(
+            "NVMe streaming mode: {:.2} GB NVMe spill, est. committed {:.1} GB + {:.1} GB NVMe > {:.1} GB limit",
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+            estimated_committed as f64 / (1u64 << 30) as f64,
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+            total_ram.saturating_sub(headroom) as f64 / (1u64 << 30) as f64,
+        );
+    }
+    prefetch_state
+        .keep_nvme_resident
+        .store(keep_resident, std::sync::atomic::Ordering::Relaxed);
+
+    // Start multi-threaded I/O pool (opens per-worker F_NOCACHE fds)
+    let num_io_workers = (num_performance_cores() as usize / 2).clamp(2, 4);
+    prefetch_state.start_io_pool(num_io_workers)?;
+
+    // Only preload when the full model fits with 6 GB headroom.
+    // For "barely overflows" models (Mixtral on 32GB), skip preloading —
+    // layers will be loaded lazily via ensure_layer_loaded on first use,
+    // then kept resident (not released) for subsequent tokens.
+    if should_preload {
+        prefetch_state.preload_ram_layers();
+    } else if keep_resident {
+        tracing::info!(
+            "Skipping preload: model {:.1} GB exceeds preload threshold {:.1} GB (will load lazily)",
+            model_total_bytes as f64 / (1u64 << 30) as f64,
+            (total_ram.saturating_sub(6 * (1 << 30))) as f64 / (1u64 << 30) as f64,
+        );
+    }
 
     let nvme_tensor_count = prefetch_state.tensor_map.len();
     let nvme_layer_count = prefetch_state.layer_regions.len();
@@ -313,21 +699,51 @@ pub fn generate_with_nvme_scheduling(
     // Pass PrefetchState to cb_eval callback
     let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
 
-    let mut ctx = LlamaContext::new_with_callback(
+    let kv_quant = plan.kv_cache_plan.kv_quantization;
+    let mut ctx = LlamaContext::new_with_callback_and_kv(
         &model,
         config.n_ctx,
         config.n_batch,
         config.n_threads,
         Some(eval_callback),
         state_ptr,
+        kv_quant,
     )?;
 
     let mut sampler = LlamaSampler::new(&config.sampling);
+
+    // KV cache manager for windowed compaction (Phase 3b)
+    let mut kv_manager = if plan.kv_cache_plan.warm_window_tokens > 0 {
+        Some(crate::cache::kv_cache::KvCacheManager::new(
+            plan.kv_cache_plan.hot_window_tokens,
+        ))
+    } else {
+        None
+    };
 
     // Tokenize prompt
     let tokens = model.tokenize(prompt, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
+
+    // Eagerly prefetch NVMe layers before the first forward pass.
+    prefetch_state.prefetch_all_nvme();
+
+    if keep_resident {
+        // Keep-resident mode: disable the eval callback immediately. Layer data
+        // is provided by llama.cpp's own mmap mechanism (use_mmap=true) — our
+        // buffer's posix_memalign pages are overlaid with mmap file pages during
+        // model loading. Calling pread would REPLACE these efficient file-backed
+        // pages with anonymous pages, increasing memory pressure.
+        //
+        // The prefetch_all_nvme above still runs to ensure NVMe layers are loaded
+        // via pread (those might not have mmap pages committed). The callback is
+        // disabled so it won't block the forward pass.
+        tracing::info!("Keep-resident mode; disabling eval callback");
+        prefetch_state
+            .prefetch_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Process prompt
     let prompt_start = Instant::now();
@@ -336,6 +752,11 @@ pub fn generate_with_nvme_scheduling(
         ctx.decode(chunk)?;
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Set KV cache manager position after prompt processing
+    if let Some(ref mut kv_mgr) = kv_manager {
+        kv_mgr.set_position(prompt_len);
+    }
 
     // Generation loop with active prefetch/release
     let mut generated_text = String::new();
@@ -378,14 +799,23 @@ pub fn generate_with_nvme_scheduling(
             break;
         }
 
+        // KV cache compaction for long-context inference
+        if let Some(ref mut kv_mgr) = kv_manager {
+            kv_mgr.advance(&ctx);
+        }
+
+        // In standard mode, request NVMe layers before next forward pass
+        // to maximize prefetch lead time. In keep-resident mode, layers
+        // are already loaded and this is a no-op.
+        if !keep_resident {
+            prefetch_state.prefetch_all_nvme();
+        }
+
         ctx.decode(&[token_id])?;
     }
 
-    // Stop prefetch thread and clean up
-    prefetch_state.stop_prefetch_thread();
-    if let Some(handle) = prefetch_handle {
-        let _ = handle.join();
-    }
+    // Stop I/O pool and clean up
+    prefetch_state.stop_io_pool();
 
     // Clean up the Arc we leaked into the callback
     unsafe {
@@ -408,6 +838,23 @@ pub fn generate_with_nvme_scheduling(
         prompt_eval_ms: prompt_ms,
         perf,
     })
+}
+
+/// Query total physical RAM via sysctl (macOS).
+fn total_physical_memory() -> u64 {
+    unsafe {
+        let mut size: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = b"hw.memsize\0";
+        libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            &mut size as *mut u64 as *mut libc::c_void,
+            &mut len as *mut usize,
+            std::ptr::null_mut(),
+            0,
+        );
+        if size == 0 { 32 * (1 << 30) } else { size }
+    }
 }
 
 fn num_performance_cores() -> i32 {
@@ -461,7 +908,7 @@ mod tests {
             kv_cache_plan: KvCachePlan {
                 hot_window_tokens: 0, warm_window_tokens: 0,
                 hot_tier: StorageTier::Gpu, warm_tier: StorageTier::Ram,
-                hot_bytes: 0, warm_bytes: 0,
+                hot_bytes: 0, warm_bytes: 0, kv_quantization: None,
             },
             experience_tier: ExperienceTier::Fast,
         }

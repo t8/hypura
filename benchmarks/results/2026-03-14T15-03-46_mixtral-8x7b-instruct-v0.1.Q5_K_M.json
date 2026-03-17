@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-03-14T15:03:46.924050+00:00",
+  "model": {
+    "name": "mixtral-8x7b-instruct-v0.1.Q5_K_M",
+    "architecture": "llama",
+    "params": "46.7B",
+    "quant": "Q5K",
+    "size_gb": 30.94676971435547
+  },
+  "hardware": {
+    "cpu": "Apple M1 Max",
+    "ram_gb": 32.0,
+    "gpu": "Apple M1 Max",
+    "nvme_seq_gbps": 5.093685141
+  },
+  "placement": {
+    "gpu_gb": 23.69890594482422,
+    "ram_gb": 5.26708984375,
+    "nvme_gb": 1.98077392578125
+  },
+  "config": {
+    "context": 2048,
+    "max_tokens": 10,
+    "prompt": "Write a short paragraph about artificial intelligence.",
+    "n_gpu_layers": 25
+  },
+  "baseline": null,
+  "hypura": {
+    "prompt_eval_ms": 27098.071125000002,
+    "tok_per_sec": 0.19048925410587259,
+    "tokens_generated": 10,
+    "wall_time_ms": 102860.51325
+  },
+  "speedup": null
+}

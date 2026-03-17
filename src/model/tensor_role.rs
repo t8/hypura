@@ -13,6 +13,10 @@ pub enum TensorRole {
     FfnDown,
     MoeRouter,
     MoeExpert { expert_id: u32 },
+    /// Fused expert tensor containing all experts in one tensor (e.g., Mixtral's
+    /// `ffn_gate_exps.weight` with dims [hidden, intermediate, num_experts]).
+    /// Each expert's data is a contiguous stride of `total_size / num_experts`.
+    MoeFusedExperts,
     Norm,
     OutputHead,
     Other(String),
@@ -48,6 +52,13 @@ impl TensorRole {
             return Self::MoeRouter;
         }
         if name.contains("_exps.") {
+            // Fused expert tensors: all experts in one tensor (e.g., Mixtral).
+            // Detected by the `_exps.` suffix without a per-expert numeric index
+            // after it. Pattern: `blk.N.ffn_gate_exps.weight` (fused) vs
+            // `blk.N.ffn_gate_exps.0.weight` (individual, rare).
+            if is_fused_expert_tensor(name) {
+                return Self::MoeFusedExperts;
+            }
             let expert_id = parse_expert_id(name).unwrap_or(0);
             return Self::MoeExpert { expert_id };
         }
@@ -79,7 +90,7 @@ impl TensorRole {
     /// Whether this tensor is accessed every token (vs. probabilistically for MoE experts).
     pub fn access_frequency(&self, experts_per_token: u32, total_experts: u32) -> f64 {
         match self {
-            Self::MoeExpert { .. } => {
+            Self::MoeExpert { .. } | Self::MoeFusedExperts => {
                 if total_experts > 0 {
                     experts_per_token as f64 / total_experts as f64
                 } else {
@@ -88,6 +99,20 @@ impl TensorRole {
             }
             _ => 1.0,
         }
+    }
+}
+
+/// Check if a `_exps.` tensor is fused (all experts in one tensor) rather than
+/// individually addressed. Fused pattern: `blk.N.ffn_gate_exps.weight` — the
+/// part after `_exps.` is `weight` (not a number). Individual pattern:
+/// `blk.N.ffn_gate_exps.0.weight` — a numeric expert ID follows `_exps.`.
+fn is_fused_expert_tensor(name: &str) -> bool {
+    if let Some(pos) = name.find("_exps.") {
+        let after = &name[pos + 6..]; // skip "_exps."
+        // If the next segment is NOT a number, it's fused
+        !after.starts_with(|c: char| c.is_ascii_digit())
+    } else {
+        false
     }
 }
 
@@ -127,6 +152,19 @@ mod tests {
         assert_eq!(
             TensorRole::from_name("blk.0.ffn_gate_inp.weight"),
             TensorRole::MoeRouter
+        );
+        // Fused expert tensors (Mixtral-style: all experts in one tensor)
+        assert_eq!(
+            TensorRole::from_name("blk.0.ffn_gate_exps.weight"),
+            TensorRole::MoeFusedExperts
+        );
+        assert_eq!(
+            TensorRole::from_name("blk.0.ffn_up_exps.weight"),
+            TensorRole::MoeFusedExperts
+        );
+        assert_eq!(
+            TensorRole::from_name("blk.0.ffn_down_exps.weight"),
+            TensorRole::MoeFusedExperts
         );
     }
 }

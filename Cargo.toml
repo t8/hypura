@@ -45,6 +45,7 @@ anyhow = "1"
 thiserror = "2"
 
 # Misc
+tokio-stream = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 byteorder = "1"
 memmap2 = "0.9"

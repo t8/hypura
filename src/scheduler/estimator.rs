@@ -86,7 +86,7 @@ pub fn estimate_performance(
                 StorageTier::Nvme => {
                     let effective_freq = if metadata.is_moe {
                         match role {
-                            TensorRole::MoeExpert { .. } => {
+                            TensorRole::MoeExpert { .. } | TensorRole::MoeFusedExperts => {
                                 freq * (1.0 - MOE_CACHE_HIT_RATE)
                             }
                             _ => freq,

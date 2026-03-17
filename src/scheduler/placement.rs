@@ -10,7 +10,7 @@ use crate::scheduler::prefetch::build_prefetch_schedule;
 use crate::scheduler::types::*;
 
 const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for macOS
-const GPU_RUNTIME_OVERHEAD: u64 = 1 << 30; // 1 GiB reserved for compute buffers + Metal overhead
+const GPU_RUNTIME_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for compute buffers + Metal overhead
 const SYNC_OVERHEAD_PER_LAYER_US: f64 = 50.0; // 50μs CPU-GPU sync per layer
 
 pub fn compute_placement(
@@ -399,8 +399,8 @@ fn compute_kv_cache_plan(
     _assignments: &HashMap<String, StorageTier>,
     caps: &TierCapacities,
 ) -> KvCachePlan {
-    let kv_per_token = estimate_kv_bytes(metadata, 1);
-    if kv_per_token == 0 {
+    let kv_per_token_fp16 = estimate_kv_bytes(metadata, 1);
+    if kv_per_token_fp16 == 0 {
         return KvCachePlan {
             hot_window_tokens: context_length,
             warm_window_tokens: 0,
@@ -408,8 +408,33 @@ fn compute_kv_cache_plan(
             warm_tier: StorageTier::Ram,
             hot_bytes: 0,
             warm_bytes: 0,
+            kv_quantization: None,
         };
     }
+
+    let total_fp16_kv = kv_per_token_fp16 * context_length as u64;
+
+    // Auto-select Q8 KV when GPU budget is tight:
+    // FP16 KV exceeds 40% of GPU budget, but Q8 KV fits in 25%
+    let kv_quantization = if caps.gpu_bytes > 0
+        && total_fp16_kv > caps.gpu_bytes * 2 / 5
+        && (total_fp16_kv / 2) <= caps.gpu_bytes / 4
+    {
+        tracing::info!(
+            "Auto-selecting Q8 KV: FP16 KV {:.1} GB > 40% of GPU {:.1} GB",
+            total_fp16_kv as f64 / (1u64 << 30) as f64,
+            caps.gpu_bytes as f64 / (1u64 << 30) as f64,
+        );
+        Some(KvQuantization::Q8_0)
+    } else {
+        None
+    };
+
+    let kv_per_token = if kv_quantization.is_some() {
+        kv_per_token_fp16 / 2
+    } else {
+        kv_per_token_fp16
+    };
 
     // 20% of GPU budget for hot KV cache
     let gpu_kv_budget = caps.gpu_bytes / 5;
@@ -417,7 +442,7 @@ fn compute_kv_cache_plan(
     let warm_tokens = context_length.saturating_sub(hot_tokens);
 
     // Q8 warm cache uses ~half the bytes of FP16
-    let kv_per_token_q8 = kv_per_token / 2;
+    let kv_per_token_q8 = kv_per_token_fp16 / 2;
 
     KvCachePlan {
         hot_window_tokens: hot_tokens,
@@ -426,6 +451,7 @@ fn compute_kv_cache_plan(
         warm_tier: StorageTier::Ram,
         hot_bytes: hot_tokens as u64 * kv_per_token,
         warm_bytes: warm_tokens as u64 * kv_per_token_q8,
+        kv_quantization,
     }
 }
 
