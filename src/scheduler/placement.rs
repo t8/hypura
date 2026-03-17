@@ -42,17 +42,32 @@ pub fn compute_placement_with_context(
     // Score and sort tensors
     let scored = score_tensors(&model.tensors, &metadata);
 
-    // Try LP first, fall back to greedy
-    let tier_assignments = match lp_assign(&scored, &capacities, hardware, &metadata) {
-        Ok(assignments) => {
-            tracing::debug!("LP solver produced optimal placement");
-            assignments
-        }
-        Err(e) => {
-            tracing::debug!("LP solver failed ({e}), using greedy placement");
-            greedy_assign(&scored, &capacities, hardware, &metadata)
-        }
-    };
+    // Try expert-streaming for MoE models where non-expert tensors fit in memory
+    let (tier_assignments, inference_mode) =
+        if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
+            tracing::info!("Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe");
+            (es, InferenceMode::ExpertStreaming)
+        } else {
+            // Try LP first, fall back to greedy
+            let assignments = match lp_assign(&scored, &capacities, hardware, &metadata) {
+                Ok(a) => {
+                    tracing::debug!("LP solver produced optimal placement");
+                    a
+                }
+                Err(e) => {
+                    tracing::debug!("LP solver failed ({e}), using greedy placement");
+                    greedy_assign(&scored, &capacities, hardware, &metadata)
+                }
+            };
+            let has_nvme = assignments.values().any(|t| *t == StorageTier::Nvme);
+            let mode = if !has_nvme {
+                InferenceMode::FullResident
+            } else {
+                // Determined later by inference engine (keep-resident vs full-streaming)
+                InferenceMode::FullStreaming
+            };
+            (assignments, mode)
+        };
 
     // Build prefetch schedule
     let prefetch_schedule =
@@ -97,6 +112,7 @@ pub fn compute_placement_with_context(
         estimated_time_to_first_token: 0.5, // rough estimate
         kv_cache_plan,
         experience_tier,
+        inference_mode,
     })
 }
 
@@ -209,6 +225,88 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
             }
         })
         .collect()
+}
+
+/// Try expert-streaming placement for MoE models: non-expert tensors on GPU/RAM,
+/// all expert (MoeFusedExperts) tensors on NVMe. Returns None if the model is not
+/// MoE or non-expert tensors don't fit in unified memory.
+fn try_expert_streaming_assign(
+    tensors: &[ScoredTensor],
+    caps: &TierCapacities,
+    metadata: &ModelMetadata,
+) -> Option<HashMap<String, StorageTier>> {
+    if !metadata.is_moe {
+        return None;
+    }
+
+    let non_expert_bytes: u64 = tensors
+        .iter()
+        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts))
+        .map(|t| t.size_bytes)
+        .sum();
+    let expert_bytes: u64 = tensors
+        .iter()
+        .filter(|t| matches!(t.role, TensorRole::MoeFusedExperts))
+        .map(|t| t.size_bytes)
+        .sum();
+
+    // Only use expert-streaming if: non-experts fit in memory AND experts would overflow.
+    // Also: expert buffer virtual allocation must fit in Metal's address space.
+    // On unified memory, Metal sees all process memory — a 30 GB posix_memalign buffer
+    // causes Metal OOM even if physical pages aren't committed. Cap expert buffer at
+    // (gpu_max - non_expert_bytes - 1 GB headroom) to stay within Metal limits.
+    let total = non_expert_bytes + expert_bytes;
+    if non_expert_bytes > caps.unified_limit || total <= caps.unified_limit {
+        return None; // Either doesn't fit at all, or everything fits (use keep-resident)
+    }
+
+    // Metal working set check: virtual allocation of expert buffer + non-expert tensors
+    // must fit within the GPU's recommended max working set
+    let gpu_max = caps.gpu_bytes + GPU_RUNTIME_OVERHEAD; // approximate gpu_max
+    if non_expert_bytes + expert_bytes + (1 << 30) > gpu_max {
+        tracing::debug!(
+            "Expert-streaming skipped: expert buffer ({:.1} GB) + non-expert ({:.1} GB) exceeds Metal working set ({:.1} GB)",
+            expert_bytes as f64 / (1u64 << 30) as f64,
+            non_expert_bytes as f64 / (1u64 << 30) as f64,
+            gpu_max as f64 / (1u64 << 30) as f64,
+        );
+        return None;
+    }
+
+    let mut assignments = HashMap::new();
+    let mut gpu_remaining = caps.gpu_bytes;
+
+    // Assign non-expert tensors to GPU/RAM by score
+    let mut non_experts: Vec<&ScoredTensor> = tensors
+        .iter()
+        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts))
+        .collect();
+    non_experts.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    for t in non_experts {
+        if t.size_bytes <= gpu_remaining {
+            gpu_remaining -= t.size_bytes;
+            assignments.insert(t.name.clone(), StorageTier::Gpu);
+        } else {
+            assignments.insert(t.name.clone(), StorageTier::Ram);
+        }
+    }
+
+    // All expert tensors to NVMe
+    for t in tensors
+        .iter()
+        .filter(|t| matches!(t.role, TensorRole::MoeFusedExperts))
+    {
+        assignments.insert(t.name.clone(), StorageTier::Nvme);
+    }
+
+    tracing::info!(
+        "Expert-streaming: {:.1} GB non-expert resident, {:.1} GB expert on NVMe",
+        non_expert_bytes as f64 / (1u64 << 30) as f64,
+        expert_bytes as f64 / (1u64 << 30) as f64,
+    );
+
+    Some(assignments)
 }
 
 fn greedy_assign(

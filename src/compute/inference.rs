@@ -11,6 +11,7 @@ use crate::compute::nvme_backend::{
 };
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
+use crate::model::tensor_role::TensorRole;
 use crate::profiler::types::HardwareProfile;
 use crate::scheduler::types::*;
 use crate::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
@@ -390,27 +391,38 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
 
 /// Derive `n_gpu_layers` from a PlacementPlan.
 ///
-/// Caps at the minimum of:
-/// 1. The first NVMe layer (layers with NVMe tensors must stay on CPU)
-/// 2. The GPU working set capacity (all tensors in GPU-offloaded layers
-///    go to Metal shared buffers, regardless of the plan's GPU/RAM split)
+/// In expert-streaming mode, expert tensors are on the Hypura NVMe buffer (not Metal),
+/// so they don't count against GPU working set or the NVMe-layer cutoff. All layers
+/// can be offloaded to Metal — the eval_callback loads expert data on demand.
 ///
-/// On Apple Silicon, `n_gpu_layers` controls which layers get Metal buffers.
-/// Layers between the GPU cap and NVMe cutoff run on CPU with mmap'd weights.
+/// In other modes, caps at the minimum of:
+/// 1. The first NVMe layer (layers with NVMe tensors must stay on CPU)
+/// 2. The GPU working set capacity
 pub fn gpu_layers_from_placement(
     plan: &PlacementPlan,
     gguf: &GgufFile,
     gpu_budget_bytes: u64,
 ) -> i32 {
+    let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
     let mut max_layer: i32 = -1;
     let mut first_nvme_layer: Option<u32> = None;
 
-    // Compute per-layer sizes and find NVMe cutoff
+    // Compute per-layer sizes (excluding expert tensors in expert-streaming mode)
     let mut layer_sizes: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
 
     for t in &gguf.tensors {
         if let Some(layer_idx) = t.layer_index {
             max_layer = max_layer.max(layer_idx as i32);
+
+            // In expert-streaming, expert tensors go to the Hypura buffer,
+            // not Metal shared buffers — don't count them.
+            if expert_streaming {
+                let role = TensorRole::from_name(&t.name);
+                if matches!(role, TensorRole::MoeFusedExperts) {
+                    continue; // Skip expert tensors for GPU budget/NVMe cutoff
+                }
+            }
+
             *layer_sizes.entry(layer_idx).or_default() += t.size_bytes;
             if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
                 first_nvme_layer = Some(match first_nvme_layer {
@@ -425,15 +437,13 @@ pub fn gpu_layers_from_placement(
         return 0;
     }
 
-    // Cap by NVMe cutoff
+    // Cap by NVMe cutoff (in expert-streaming, first_nvme_layer is None → no cap)
     let from_nvme = match first_nvme_layer {
         Some(nvme_start) => nvme_start as i32 + 1,
         None => max_layer + 1 + 1,
     };
 
     // Cap by GPU working set: sum layers until budget exhausted.
-    // Start with non-layer tensors (embedding, output head) since they also
-    // go to Metal shared buffers when GPU-offloaded.
     let non_layer_gpu_size: u64 = gguf
         .tensors
         .iter()
@@ -668,9 +678,23 @@ pub fn generate_with_nvme_scheduling(
             total_ram.saturating_sub(headroom) as f64 / (1u64 << 30) as f64,
         );
     }
-    prefetch_state
-        .keep_nvme_resident
-        .store(keep_resident, std::sync::atomic::Ordering::Relaxed);
+    let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
+
+    if expert_streaming {
+        // Expert-streaming: non-expert tensors on GPU/Metal, experts on NVMe buffer.
+        // The eval_callback stays enabled and loads experts on demand.
+        tracing::info!(
+            "Expert-streaming mode: {:.2} GB expert tensors on NVMe, loaded on demand",
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+        );
+        prefetch_state
+            .expert_streaming
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        prefetch_state
+            .keep_nvme_resident
+            .store(keep_resident, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Start multi-threaded I/O pool (opens per-worker F_NOCACHE fds)
     let num_io_workers = (num_performance_cores() as usize / 2).clamp(2, 4);
@@ -680,9 +704,10 @@ pub fn generate_with_nvme_scheduling(
     // For "barely overflows" models (Mixtral on 32GB), skip preloading —
     // layers will be loaded lazily via ensure_layer_loaded on first use,
     // then kept resident (not released) for subsequent tokens.
-    if should_preload {
+    // Expert-streaming never preloads — experts are loaded on demand.
+    if !expert_streaming && should_preload {
         prefetch_state.preload_ram_layers();
-    } else if keep_resident {
+    } else if keep_resident && !expert_streaming {
         tracing::info!(
             "Skipping preload: model {:.1} GB exceeds preload threshold {:.1} GB (will load lazily)",
             model_total_bytes as f64 / (1u64 << 30) as f64,
@@ -726,15 +751,18 @@ pub fn generate_with_nvme_scheduling(
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
-    // Enable I/O tracing for streaming mode diagnostics.
-    if !keep_resident {
+    // Enable I/O tracing for streaming/expert-streaming diagnostics.
+    if !keep_resident || expert_streaming {
         prefetch_state.enable_trace();
     }
 
     // Eagerly prefetch NVMe layers before the first forward pass.
-    prefetch_state.prefetch_all_nvme();
+    // Expert-streaming: don't prefetch — experts loaded on demand by eval_callback.
+    if !expert_streaming {
+        prefetch_state.prefetch_all_nvme();
+    }
 
-    if keep_resident {
+    if keep_resident && !expert_streaming {
         // Keep-resident mode: disable the eval callback immediately. Layer data
         // is provided by llama.cpp's own mmap mechanism (use_mmap=true) — our
         // buffer's posix_memalign pages are overlaid with mmap file pages during
@@ -809,10 +837,10 @@ pub fn generate_with_nvme_scheduling(
             kv_mgr.advance(&ctx);
         }
 
-        // In standard mode, request NVMe layers before next forward pass
-        // to maximize prefetch lead time. In keep-resident mode, layers
-        // are already loaded and this is a no-op.
-        if !keep_resident {
+        // In standard streaming mode, request NVMe layers before next forward pass.
+        // Keep-resident and expert-streaming modes don't need this — keep-resident
+        // has all data loaded, expert-streaming loads experts via eval_callback.
+        if !keep_resident && !expert_streaming {
             prefetch_state.prefetch_all_nvme();
         }
 
@@ -922,6 +950,7 @@ mod tests {
                 hot_bytes: 0, warm_bytes: 0, kv_quantization: None,
             },
             experience_tier: ExperienceTier::Fast,
+            inference_mode: InferenceMode::FullStreaming,
         }
     }
 

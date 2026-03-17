@@ -322,6 +322,9 @@ pub struct PrefetchState {
 
     // --- I/O tracing ---
 
+    /// Expert-streaming mode: non-expert tensors GPU-resident, experts loaded on demand.
+    pub expert_streaming: AtomicBool,
+
     /// When true, record timestamped I/O events for post-hoc analysis.
     pub trace_enabled: AtomicBool,
     /// Trace event log. Only populated when `trace_enabled` is true.
@@ -710,6 +713,169 @@ impl PrefetchState {
         let loadable_per_compute = throughput * compute_time_secs;
         let needed = (avg_layer_bytes as f64 / loadable_per_compute).ceil() as u32;
         needed.clamp(2, 8)
+    }
+
+    /// Load selected experts for a layer, blocking until complete.
+    /// Uses neuron cache to skip already-loaded expert strides.
+    pub fn ensure_experts_loaded(&self, layer_idx: u32, expert_ids: &[u32]) {
+        if expert_ids.is_empty() || !self.expert_layouts.contains_key(&layer_idx) {
+            return;
+        }
+
+        let tracing = self.trace_enabled.load(Ordering::Relaxed);
+
+        // Check which experts need loading (cache misses)
+        let needs_load = {
+            let mut cache = self.neuron_cache.lock().unwrap();
+            let mut missing = false;
+            if let Some(layouts) = self.expert_layouts.get(&layer_idx) {
+                for &eid in expert_ids {
+                    for layout in layouts {
+                        let tt = ExpertTensorType::from_name(&layout.tensor_name)
+                            .unwrap_or(ExpertTensorType::Gate);
+                        if !cache.is_loaded(layer_idx, eid, tt) {
+                            missing = true;
+                            break;
+                        }
+                    }
+                    if missing {
+                        break;
+                    }
+                }
+            }
+            missing
+        };
+
+        if !needs_load {
+            if tracing {
+                self.trace.record(TraceEvent::LayerHit(layer_idx));
+            }
+            return;
+        }
+
+        // Submit expert load — reuse layer status mechanism for blocking
+        let wait_start = Instant::now();
+        {
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loading);
+        }
+
+        self.submit_expert_load_with_status(layer_idx, expert_ids);
+
+        // Wait for completion
+        let mut status = self.layer_status.lock().unwrap();
+        while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
+            status = self.layer_notify.wait(status).unwrap();
+        }
+
+        if tracing {
+            let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+            self.trace
+                .record(TraceEvent::LayerStall { layer: layer_idx, wait_ms });
+        }
+    }
+
+    /// Submit expert-only loads that update layer status on completion (for blocking waits).
+    fn submit_expert_load_with_status(&self, layer_idx: u32, expert_ids: &[u32]) {
+        if !self.expert_layouts.contains_key(&layer_idx) {
+            return;
+        }
+
+        let base = *self.buffer_base.lock().unwrap();
+        if base.is_null() {
+            return;
+        }
+
+        let mut task_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
+
+        // Non-expert regions for this layer (if any are in the buffer)
+        if let Some(regions) = self.non_expert_regions.get(&layer_idx) {
+            if !regions.is_empty() {
+                task_regions.push(regions.clone());
+            }
+        }
+
+        // Expert strides
+        {
+            let mut cache = self.neuron_cache.lock().unwrap();
+            if let Some(layouts) = self.expert_layouts.get(&layer_idx) {
+                for layout in layouts {
+                    let tensor_type = ExpertTensorType::from_name(&layout.tensor_name)
+                        .unwrap_or(ExpertTensorType::Gate);
+                    let mut regions = Vec::new();
+                    for &eid in expert_ids {
+                        if eid >= layout.num_experts {
+                            continue;
+                        }
+                        if cache.is_loaded(layer_idx, eid, tensor_type) {
+                            continue;
+                        }
+                        regions.push((
+                            layout.expert_buffer_offset(eid),
+                            layout.expert_stride,
+                            layout.expert_file_offset(eid),
+                        ));
+                        // MADV_FREE evicted expert's pages on cache eviction
+                        if let Some((ev_l, ev_e, ev_t)) =
+                            cache.mark_loaded(layer_idx, eid, tensor_type)
+                        {
+                            if let Some(ev_layouts) = self.expert_layouts.get(&ev_l) {
+                                for ev_layout in ev_layouts {
+                                    if ExpertTensorType::from_name(&ev_layout.tensor_name)
+                                        == Some(ev_t)
+                                    {
+                                        let offset = ev_layout.expert_buffer_offset(ev_e);
+                                        let ptr = unsafe { base.add(offset) };
+                                        unsafe {
+                                            libc::madvise(
+                                                ptr as *mut c_void,
+                                                ev_layout.expert_stride,
+                                                libc::MADV_FREE,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !regions.is_empty() {
+                        task_regions.push(regions);
+                    }
+                }
+            }
+        }
+
+        if task_regions.is_empty() {
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loaded);
+            self.layer_notify.notify_all();
+            return;
+        }
+
+        // update_status: true so completion triggers LayerStatus::Loaded + notify
+        let completion = Arc::new(IoCompletion {
+            remaining: AtomicUsize::new(task_regions.len()),
+            layer_idx,
+            update_status: true,
+        });
+
+        let pool = self.io_pool.lock().unwrap();
+        if let Some(ref pool) = *pool {
+            if let Some(ref tx) = pool.tx {
+                for regions in task_regions {
+                    let _ = tx.send(IoPoolTask {
+                        regions,
+                        base,
+                        completion: completion.clone(),
+                    });
+                }
+            }
+        } else {
+            drop(pool);
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loaded);
+            self.layer_notify.notify_all();
+        }
     }
 
     /// Enable I/O tracing for diagnostic analysis.
@@ -1107,6 +1273,7 @@ impl HypuraBuftController {
             debug_logged_tensors: AtomicI32::new(0),
             co_activation: Mutex::new(co_activation),
             prev_layer_experts: Mutex::new(None),
+            expert_streaming: AtomicBool::new(false),
             trace_enabled: AtomicBool::new(false),
             trace: IoTrace::new(),
         })
@@ -1127,11 +1294,44 @@ impl Drop for HypuraBuftController {
 
 /// Build `tensor_buft_overrides` patterns from a PlacementPlan.
 pub fn build_override_patterns(
-    _plan: &PlacementPlan,
+    plan: &PlacementPlan,
     gguf: &GgufFile,
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
     n_gpu_layers: i32,
 ) -> (Vec<CString>, Vec<hypura_sys::llama_model_tensor_buft_override>) {
+    // Expert-streaming mode: only override tensors explicitly assigned to NVMe
+    // (expert tensors). Non-expert tensors in the same layer stay on Metal.
+    if plan.inference_mode == InferenceMode::ExpertStreaming {
+        let mut patterns = Vec::new();
+        for t in &gguf.tensors {
+            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
+                let escaped = regex_escape(&t.name);
+                patterns.push(format!("^{}$", escaped));
+            }
+        }
+
+        let c_patterns: Vec<CString> = patterns
+            .iter()
+            .map(|p| CString::new(p.as_str()).unwrap())
+            .collect();
+
+        let mut overrides: Vec<hypura_sys::llama_model_tensor_buft_override> = c_patterns
+            .iter()
+            .map(|p| hypura_sys::llama_model_tensor_buft_override {
+                pattern: p.as_ptr(),
+                buft: buft_ptr,
+            })
+            .collect();
+
+        overrides.push(hypura_sys::llama_model_tensor_buft_override {
+            pattern: std::ptr::null(),
+            buft: std::ptr::null_mut(),
+        });
+
+        return (c_patterns, overrides);
+    }
+
+    // Standard mode: override entire non-GPU layers
     let first_non_gpu_layer = if n_gpu_layers > 0 {
         (n_gpu_layers - 1) as u32
     } else {
@@ -1251,6 +1451,11 @@ pub extern "C" fn eval_callback(
         return true;
     }
 
+    // Expert-streaming mode: load only selected experts, keep non-expert tensors resident
+    if state.expert_streaming.load(Ordering::Relaxed) {
+        return eval_callback_expert_streaming(state, layer_idx, ask);
+    }
+
     if ask {
         state.ensure_layer_loaded(layer_idx);
     } else {
@@ -1330,6 +1535,121 @@ pub extern "C" fn eval_callback(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    true
+}
+
+/// Expert-streaming eval_callback path: load only selected experts on demand.
+fn eval_callback_expert_streaming(state: &PrefetchState, layer_idx: u32, ask: bool) -> bool {
+    if ask {
+        // Before computation: load selected experts for this MoE layer
+        if !state.expert_layouts.contains_key(&layer_idx) {
+            // Non-MoE layer within the model — data is GPU-resident, nothing to do
+            return true;
+        }
+
+        let experts = state
+            .selected_experts
+            .lock()
+            .unwrap()
+            .get(&layer_idx)
+            .cloned();
+
+        if let Some(expert_ids) = experts {
+            state.ensure_experts_loaded(layer_idx, &expert_ids);
+        } else {
+            // No router output yet — use co-activation prediction or load all
+            let predicted = {
+                let co_act = state.co_activation.lock().unwrap();
+                if co_act.has_data() {
+                    co_act.predict_next_layer(layer_idx, &[], state.num_experts_used as usize)
+                } else {
+                    Vec::new()
+                }
+            };
+
+            if predicted.is_empty() {
+                // True cold start — load all experts for this layer
+                state.ensure_layer_loaded(layer_idx);
+            } else {
+                state.ensure_experts_loaded(layer_idx, &predicted);
+            }
+        }
+    } else {
+        // After computation: track layer, record co-activation, prefetch next
+        let prev = state
+            .current_layer
+            .swap(layer_idx as i32, Ordering::Relaxed);
+
+        if state.expert_layouts.contains_key(&layer_idx) {
+            if let Some(experts) = state
+                .selected_experts
+                .lock()
+                .unwrap()
+                .get(&layer_idx)
+                .cloned()
+            {
+                state
+                    .co_activation
+                    .lock()
+                    .unwrap()
+                    .record(layer_idx, &experts);
+
+                {
+                    let mut prev_exp = state.prev_layer_experts.lock().unwrap();
+                    if let Some((prev_l, ref prev_e)) = *prev_exp {
+                        state
+                            .co_activation
+                            .lock()
+                            .unwrap()
+                            .record_cross_layer(prev_l, prev_e, &experts);
+                    }
+                    *prev_exp = Some((layer_idx, experts.clone()));
+                }
+
+                // Predict and prefetch next MoE layer's experts
+                let predicted = {
+                    let co_act = state.co_activation.lock().unwrap();
+                    if co_act.has_data() {
+                        co_act.predict_next_layer(layer_idx, &experts, 3)
+                    } else {
+                        experts.clone()
+                    }
+                };
+
+                let mut prefetch_experts = experts;
+                for p in predicted {
+                    if !prefetch_experts.contains(&p) {
+                        prefetch_experts.push(p);
+                    }
+                }
+                prefetch_experts.truncate(4);
+
+                for lookahead in 1..4 {
+                    let target = layer_idx + lookahead;
+                    if target < state.num_layers
+                        && state.expert_layouts.contains_key(&target)
+                    {
+                        state.request_prefetch(PrefetchRequest::ExpertSlices {
+                            layer_idx: target,
+                            expert_ids: prefetch_experts.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Reset layer status to NotLoaded so next token can re-load experts.
+        // (Expert data may have been evicted by neuron cache LRU.)
+        if state.expert_layouts.contains_key(&layer_idx) && prev >= 0 {
+            let prev_layer = prev as u32;
+            if prev_layer != layer_idx && prev_layer < layer_idx {
+                let mut status = state.layer_status.lock().unwrap();
+                status.insert(prev_layer, LayerStatus::NotLoaded);
             }
         }
     }

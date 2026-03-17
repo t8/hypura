@@ -52,6 +52,19 @@ impl ExperienceTier {
     }
 }
 
+/// Inference mode determined by model size, MoE structure, and hardware capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InferenceMode {
+    /// All tensors fit in GPU+RAM. No NVMe I/O.
+    FullResident,
+    /// NVMe spill is small enough to keep loaded after first pass.
+    KeepResident,
+    /// MoE model: non-expert tensors resident, experts streamed from NVMe on demand.
+    ExpertStreaming,
+    /// Heavy NVMe spill: all NVMe layers streamed, loaded/released per token.
+    FullStreaming,
+}
+
 /// Complete placement plan for a model on specific hardware.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementPlan {
@@ -64,6 +77,7 @@ pub struct PlacementPlan {
     pub estimated_time_to_first_token: f64,
     pub kv_cache_plan: KvCachePlan,
     pub experience_tier: ExperienceTier,
+    pub inference_mode: InferenceMode,
 }
 
 /// Schedule for prefetching tensors from slower tiers.
