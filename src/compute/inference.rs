@@ -726,6 +726,11 @@ pub fn generate_with_nvme_scheduling(
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
+    // Enable I/O tracing for streaming mode diagnostics.
+    if !keep_resident {
+        prefetch_state.enable_trace();
+    }
+
     // Eagerly prefetch NVMe layers before the first forward pass.
     prefetch_state.prefetch_all_nvme();
 
@@ -811,8 +816,14 @@ pub fn generate_with_nvme_scheduling(
             prefetch_state.prefetch_all_nvme();
         }
 
+        let decode_start = std::time::Instant::now();
         ctx.decode(&[token_id])?;
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        prefetch_state.record_decode(decode_ms);
     }
+
+    // Print I/O trace summary (streaming mode only)
+    prefetch_state.print_trace_summary();
 
     // Stop I/O pool and clean up
     prefetch_state.stop_io_pool();

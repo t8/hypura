@@ -195,11 +195,20 @@ fn io_worker(
 
         // Decrement completion counter
         let prev = task.completion.remaining.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 && task.completion.update_status {
-            // Last task for this layer — mark complete
-            let mut status = state.layer_status.lock().unwrap();
-            status.insert(task.completion.layer_idx, LayerStatus::Loaded);
-            state.layer_notify.notify_all();
+        if prev == 1 {
+            if state.trace_enabled.load(Ordering::Relaxed) {
+                state.trace.record(TraceEvent::LoadComplete {
+                    layer: task.completion.layer_idx,
+                    bytes: total,
+                    io_ms: elapsed_ns as f64 / 1e6,
+                });
+            }
+            if task.completion.update_status {
+                // Last task for this layer — mark complete
+                let mut status = state.layer_status.lock().unwrap();
+                status.insert(task.completion.layer_idx, LayerStatus::Loaded);
+                state.layer_notify.notify_all();
+            }
         }
     }
 }
@@ -221,6 +230,41 @@ fn pread_region(fd: i32, base: *mut u8, offset: usize, size: usize, file_offset:
             break;
         }
         read += n as usize;
+    }
+}
+
+/// Trace event for I/O timeline analysis.
+#[derive(Debug, Clone)]
+pub enum TraceEvent {
+    /// ensure_layer_loaded found the layer already loaded (no I/O wait).
+    LayerHit(u32),
+    /// ensure_layer_loaded had to wait for I/O to complete.
+    LayerStall { layer: u32, wait_ms: f64 },
+    /// I/O pool completed loading a layer.
+    LoadComplete { layer: u32, bytes: u64, io_ms: f64 },
+    /// Layer pages released via MADV_FREE.
+    Released(u32),
+    /// ctx.decode completed for one token.
+    DecodeComplete { decode_ms: f64 },
+}
+
+/// Collects timestamped trace events during inference for post-hoc analysis.
+pub struct IoTrace {
+    start: Instant,
+    events: Mutex<Vec<(f64, TraceEvent)>>,
+}
+
+impl IoTrace {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            events: Mutex::new(Vec::with_capacity(4096)),
+        }
+    }
+
+    fn record(&self, event: TraceEvent) {
+        let ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        self.events.lock().unwrap().push((ms, event));
     }
 }
 
@@ -275,6 +319,13 @@ pub struct PrefetchState {
     pub co_activation: Mutex<CoActivationMatrix>,
     /// Previous layer expert selections for cross-layer tracking.
     pub prev_layer_experts: Mutex<Option<(u32, Vec<u32>)>>,
+
+    // --- I/O tracing ---
+
+    /// When true, record timestamped I/O events for post-hoc analysis.
+    pub trace_enabled: AtomicBool,
+    /// Trace event log. Only populated when `trace_enabled` is true.
+    pub trace: IoTrace,
 }
 
 // SAFETY: buffer_base accessed under Mutex; raw pointers managed by IoPool protocol
@@ -472,16 +523,33 @@ impl PrefetchState {
     /// Ensure a layer's tensor data is loaded in physical memory.
     /// Submits to the I/O pool and waits for completion.
     pub fn ensure_layer_loaded(&self, layer_idx: u32) {
+        let tracing = self.trace_enabled.load(Ordering::Relaxed);
         let mut status = self.layer_status.lock().unwrap();
         loop {
             match status.get(&layer_idx).copied() {
-                Some(LayerStatus::Loaded) => return,
+                Some(LayerStatus::Loaded) => {
+                    if tracing {
+                        self.trace.record(TraceEvent::LayerHit(layer_idx));
+                    }
+                    return;
+                }
                 Some(LayerStatus::Loading) => {
                     // I/O pool or another thread is loading — wait
+                    let wait_start = Instant::now();
                     status = self.layer_notify.wait(status).unwrap();
+                    if tracing
+                        && status.get(&layer_idx).copied() == Some(LayerStatus::Loaded)
+                    {
+                        let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+                        self.trace.record(TraceEvent::LayerStall {
+                            layer: layer_idx,
+                            wait_ms,
+                        });
+                    }
                 }
                 _ => {
                     // Not loaded — submit to I/O pool and wait
+                    let wait_start = Instant::now();
                     status.insert(layer_idx, LayerStatus::Loading);
                     drop(status);
 
@@ -491,6 +559,13 @@ impl PrefetchState {
                     let mut status = self.layer_status.lock().unwrap();
                     while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
                         status = self.layer_notify.wait(status).unwrap();
+                    }
+                    if tracing {
+                        let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+                        self.trace.record(TraceEvent::LayerStall {
+                            layer: layer_idx,
+                            wait_ms,
+                        });
                     }
                     return;
                 }
@@ -524,6 +599,10 @@ impl PrefetchState {
             .lock()
             .unwrap()
             .insert(layer_idx, LayerStatus::NotLoaded);
+
+        if self.trace_enabled.load(Ordering::Relaxed) {
+            self.trace.record(TraceEvent::Released(layer_idx));
+        }
     }
 
     /// Pre-load all RAM-tier layers via the I/O pool.
@@ -631,6 +710,159 @@ impl PrefetchState {
         let loadable_per_compute = throughput * compute_time_secs;
         let needed = (avg_layer_bytes as f64 / loadable_per_compute).ceil() as u32;
         needed.clamp(2, 8)
+    }
+
+    /// Enable I/O tracing for diagnostic analysis.
+    pub fn enable_trace(&self) {
+        self.trace_enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// Record a decode completion event (called from inference loop).
+    pub fn record_decode(&self, decode_ms: f64) {
+        if self.trace_enabled.load(Ordering::Relaxed) {
+            self.trace.record(TraceEvent::DecodeComplete { decode_ms });
+        }
+    }
+
+    /// Print a summary of the I/O trace after inference.
+    pub fn print_trace_summary(&self) {
+        let events = self.trace.events.lock().unwrap();
+        if events.is_empty() {
+            return;
+        }
+
+        let mut total_stall_ms = 0.0;
+        let mut total_decode_ms = 0.0;
+        let mut stall_count = 0u32;
+        let mut hit_count = 0u32;
+        let mut total_io_bytes = 0u64;
+        let mut total_io_ms = 0.0;
+        let mut decode_count = 0u32;
+        let mut release_count = 0u32;
+
+        for (_, event) in events.iter() {
+            match event {
+                TraceEvent::LayerHit(_) => hit_count += 1,
+                TraceEvent::LayerStall { wait_ms, .. } => {
+                    stall_count += 1;
+                    total_stall_ms += wait_ms;
+                }
+                TraceEvent::LoadComplete { bytes, io_ms, .. } => {
+                    total_io_bytes += bytes;
+                    total_io_ms += io_ms;
+                }
+                TraceEvent::Released(_) => release_count += 1,
+                TraceEvent::DecodeComplete { decode_ms } => {
+                    decode_count += 1;
+                    total_decode_ms += decode_ms;
+                }
+            }
+        }
+
+        let total_wall_ms = events.last().map_or(0.0, |(ms, _)| *ms);
+        let accounted_ms = total_stall_ms + total_decode_ms;
+        let dead_ms = (total_wall_ms - accounted_ms).max(0.0);
+        let effective_bw = if total_io_ms > 0.0 {
+            total_io_bytes as f64 / (total_io_ms / 1000.0) / 1e9
+        } else {
+            0.0
+        };
+
+        println!();
+        println!("I/O Trace Summary ({decode_count} tokens):");
+        println!("────────────────────────────────────────────────");
+        println!(
+            "  Layer requests: {} hit (prefetch ready), {} stalled (had to wait)",
+            hit_count, stall_count
+        );
+        if stall_count > 0 {
+            println!(
+                "  Avg stall per layer:  {:.1} ms",
+                total_stall_ms / stall_count as f64
+            );
+        }
+        println!("  Total I/O stall:      {:.1} ms ({:.0}%)",
+            total_stall_ms,
+            if total_wall_ms > 0.0 { total_stall_ms / total_wall_ms * 100.0 } else { 0.0 }
+        );
+        println!("  Total decode (compute):{:.1} ms ({:.0}%)",
+            total_decode_ms,
+            if total_wall_ms > 0.0 { total_decode_ms / total_wall_ms * 100.0 } else { 0.0 }
+        );
+        println!("  Dead time (other):    {:.1} ms ({:.0}%)",
+            dead_ms,
+            if total_wall_ms > 0.0 { dead_ms / total_wall_ms * 100.0 } else { 0.0 }
+        );
+        println!("  Layers released:      {release_count}");
+        println!(
+            "  I/O pool throughput:  {:.2} GB/s ({:.1} GB in {:.1}ms worker time)",
+            effective_bw,
+            total_io_bytes as f64 / 1e9,
+            total_io_ms
+        );
+        println!("  Wall time:            {:.1} ms", total_wall_ms);
+
+        // Per-token breakdown for first 3 tokens
+        let mut token_events: Vec<Vec<&(f64, TraceEvent)>> = Vec::new();
+        let mut current_token: Vec<&(f64, TraceEvent)> = Vec::new();
+        for entry in events.iter() {
+            current_token.push(entry);
+            if matches!(entry.1, TraceEvent::DecodeComplete { .. }) {
+                token_events.push(std::mem::take(&mut current_token));
+            }
+        }
+
+        let show_tokens = token_events.len().min(3);
+        if show_tokens > 0 {
+            println!();
+            println!("  Per-token detail (first {show_tokens}):");
+        }
+        for (tok_i, tok) in token_events.iter().take(show_tokens).enumerate() {
+            let tok_stalls: Vec<_> = tok
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    TraceEvent::LayerStall { layer, wait_ms } => Some((*layer, *wait_ms)),
+                    _ => None,
+                })
+                .collect();
+            let tok_hits = tok
+                .iter()
+                .filter(|(_, e)| matches!(e, TraceEvent::LayerHit(_)))
+                .count();
+            let tok_decode = tok.iter().find_map(|(_, e)| match e {
+                TraceEvent::DecodeComplete { decode_ms } => Some(*decode_ms),
+                _ => None,
+            });
+            let tok_stall_total: f64 = tok_stalls.iter().map(|(_, ms)| ms).sum();
+
+            println!(
+                "    Token {}: decode={:.0}ms, stalls={} ({:.0}ms total), hits={}",
+                tok_i + 1,
+                tok_decode.unwrap_or(0.0),
+                tok_stalls.len(),
+                tok_stall_total,
+                tok_hits,
+            );
+            // Show individual stalls for first token
+            if tok_i == 0 {
+                for (layer, wait_ms) in &tok_stalls {
+                    let layer_bytes: u64 = self
+                        .layer_regions
+                        .get(layer)
+                        .map_or(0, |r| r.iter().map(|x| x.1 as u64).sum());
+                    let bw = if *wait_ms > 0.0 {
+                        layer_bytes as f64 / (*wait_ms / 1000.0) / 1e9
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "      Layer {layer}: stall {wait_ms:.0}ms ({:.0} MB, {bw:.2} GB/s)",
+                        layer_bytes as f64 / 1e6,
+                    );
+                }
+            }
+        }
+        println!();
     }
 }
 
@@ -875,6 +1107,8 @@ impl HypuraBuftController {
             debug_logged_tensors: AtomicI32::new(0),
             co_activation: Mutex::new(co_activation),
             prev_layer_experts: Mutex::new(None),
+            trace_enabled: AtomicBool::new(false),
+            trace: IoTrace::new(),
         })
     }
 

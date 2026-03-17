@@ -10,7 +10,7 @@ use crate::scheduler::prefetch::build_prefetch_schedule;
 use crate::scheduler::types::*;
 
 const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for macOS
-const GPU_RUNTIME_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for compute buffers + Metal overhead
+const GPU_RUNTIME_OVERHEAD: u64 = 1 << 30; // 1 GiB reserved for compute buffers + Metal overhead (actual usage ~362 MiB)
 const SYNC_OVERHEAD_PER_LAYER_US: f64 = 50.0; // 50μs CPU-GPU sync per layer
 const MOE_CACHE_HIT_RATE: f64 = 0.965; // From PowerInfer-2, matches estimator.rs
 

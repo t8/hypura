@@ -81,6 +81,14 @@ enum Commands {
         #[arg(long)]
         tensors: bool,
     },
+    /// Low-level NVMe I/O microbenchmark (diagnostic)
+    Iobench {
+        /// Path to a GGUF model file
+        model: String,
+        /// Amount of data to read in each test (GiB)
+        #[arg(long, default_value = "1.0")]
+        read_gb: f64,
+    },
     /// (MoE only) Reorganize expert layout on disk for sequential access
     Optimize {
         /// Path to model file
@@ -118,6 +126,7 @@ fn main() -> anyhow::Result<()> {
             force,
         } => cli::bench::run(&model, baseline, context, max_tokens, prompt.as_deref(), force),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
+        Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),
         Commands::Optimize { model } => cli::optimize::run(&model),
     }
 }
