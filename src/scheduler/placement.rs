@@ -12,6 +12,7 @@ use crate::scheduler::types::*;
 const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for macOS
 const GPU_RUNTIME_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for compute buffers + Metal overhead
 const SYNC_OVERHEAD_PER_LAYER_US: f64 = 50.0; // 50μs CPU-GPU sync per layer
+const MOE_CACHE_HIT_RATE: f64 = 0.965; // From PowerInfer-2, matches estimator.rs
 
 pub fn compute_placement(
     model: &GgufFile,
@@ -42,14 +43,14 @@ pub fn compute_placement_with_context(
     let scored = score_tensors(&model.tensors, &metadata);
 
     // Try LP first, fall back to greedy
-    let tier_assignments = match lp_assign(&scored, &capacities, hardware) {
+    let tier_assignments = match lp_assign(&scored, &capacities, hardware, &metadata) {
         Ok(assignments) => {
             tracing::debug!("LP solver produced optimal placement");
             assignments
         }
         Err(e) => {
             tracing::debug!("LP solver failed ({e}), using greedy placement");
-            greedy_assign(&scored, &capacities)
+            greedy_assign(&scored, &capacities, hardware, &metadata)
         }
     };
 
@@ -161,6 +162,21 @@ struct ScoredTensor {
     score: f64,
     access_freq: f64,
     layer_index: Option<u32>,
+    role: TensorRole,
+}
+
+/// Effective I/O frequency for NVMe placement, applying MoE cache-hit discount.
+fn effective_io_freq(role: &TensorRole, base_freq: f64, is_moe: bool) -> f64 {
+    if is_moe {
+        match role {
+            TensorRole::MoeExpert { .. } | TensorRole::MoeFusedExperts => {
+                base_freq * (1.0 - MOE_CACHE_HIT_RATE)
+            }
+            _ => base_freq,
+        }
+    } else {
+        base_freq
+    }
 }
 
 fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<ScoredTensor> {
@@ -189,6 +205,7 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
                 score,
                 access_freq,
                 layer_index: t.layer_index,
+                role,
             }
         })
         .collect()
@@ -197,8 +214,13 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
 fn greedy_assign(
     tensors: &[ScoredTensor],
     caps: &TierCapacities,
+    hw: &HardwareProfile,
+    metadata: &ModelMetadata,
 ) -> HashMap<String, StorageTier> {
     let mut assignments = HashMap::new();
+
+    let ram_bw = hw.memory.bandwidth_bytes_per_sec as f64;
+    let nvme_bw = caps.nvme_peak_bw as f64;
 
     // Separate layer tensors from non-layer tensors (embedding, output head, etc.)
     let mut layer_tensors: std::collections::BTreeMap<u32, Vec<&ScoredTensor>> =
@@ -232,18 +254,71 @@ fn greedy_assign(
         }
     }
 
-    // Assign layers contiguously: lowest layers to GPU/RAM, rest to NVMe.
-    // Once a layer doesn't fit, all remaining layers go to NVMe (contiguity).
-    let mut nvme_cutoff = false;
+    // Try every possible NVMe cutoff point — pick the one that minimizes
+    // total latency under the overlap model: sum of max(compute, io) per layer,
+    // where NVMe I/O is reduced by the previous layer's compute (prefetch).
+    let layer_list: Vec<(u32, &Vec<&ScoredTensor>)> =
+        layer_tensors.iter().map(|(&k, v)| (k, v)).collect();
+    let max_cutoff = layer_list.len();
 
-    for (_layer_idx, layer_ts) in &layer_tensors {
-        let layer_size: u64 = layer_ts.iter().map(|t| t.size_bytes).sum();
+    let mut best_cutoff = 0;
+    let mut best_cost = f64::MAX;
 
-        if !nvme_cutoff && layer_size <= unified_remaining {
-            unified_remaining -= layer_size;
+    for cutoff in 0..=max_cutoff {
+        // Check if layers 0..cutoff fit in unified memory
+        let resident_bytes: u64 = layer_list[..cutoff]
+            .iter()
+            .flat_map(|(_, ts)| ts.iter())
+            .map(|t| t.size_bytes)
+            .sum();
+        if resident_bytes > unified_remaining {
+            break; // This and higher cutoffs won't fit
+        }
 
-            // Within this layer, split GPU vs RAM by tensor score
-            let mut sorted_layer: Vec<&&ScoredTensor> = layer_ts.iter().collect();
+        // Cost of resident layers (GPU/RAM transfer time)
+        let resident_cost: f64 = layer_list[..cutoff]
+            .iter()
+            .flat_map(|(_, ts)| ts.iter())
+            .map(|t| t.size_bytes as f64 * t.access_freq / ram_bw)
+            .sum();
+
+        // Cost of NVMe layers with overlap model
+        let mut nvme_cost = 0.0;
+        let mut prev_compute = if cutoff > 0 {
+            // Last resident layer provides compute time for prefetch
+            layer_list[cutoff - 1]
+                .1
+                .iter()
+                .map(|t| t.size_bytes as f64 * t.access_freq / ram_bw)
+                .sum()
+        } else {
+            0.0
+        };
+
+        for &(_, ts) in &layer_list[cutoff..] {
+            let layer_io: f64 = ts
+                .iter()
+                .map(|t| {
+                    let eff = effective_io_freq(&t.role, t.access_freq, metadata.is_moe);
+                    t.size_bytes as f64 * eff / nvme_bw
+                })
+                .sum();
+            let effective_io = (layer_io - prev_compute).max(0.0);
+            nvme_cost += effective_io + SYNC_OVERHEAD_PER_LAYER_US * 1e-6;
+            prev_compute = 0.0; // NVMe layers have no compute to overlap with
+        }
+
+        let total = resident_cost + nvme_cost;
+        if total < best_cost {
+            best_cost = total;
+            best_cutoff = cutoff;
+        }
+    }
+
+    // Apply the best cutoff
+    for (i, &(_, ts)) in layer_list.iter().enumerate() {
+        if i < best_cutoff {
+            let mut sorted_layer: Vec<&&ScoredTensor> = ts.iter().collect();
             sorted_layer.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
             for t in sorted_layer {
@@ -255,8 +330,7 @@ fn greedy_assign(
                 }
             }
         } else {
-            nvme_cutoff = true;
-            for t in layer_ts {
+            for t in ts {
                 assignments.insert(t.name.clone(), StorageTier::Nvme);
             }
         }
@@ -269,6 +343,7 @@ fn lp_assign(
     tensors: &[ScoredTensor],
     caps: &TierCapacities,
     hw: &HardwareProfile,
+    metadata: &ModelMetadata,
 ) -> anyhow::Result<HashMap<String, StorageTier>> {
     let n = tensors.len();
     if n == 0 {
@@ -318,9 +393,23 @@ fn lp_assign(
         layer_nvme.push(vars.add(variable().binary()));
     }
 
-    // Objective: minimize weighted latency
+    // Continuous auxiliary variable per layer: max(compute, io) with prefetch overlap
+    let mut layer_cost = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        layer_cost.push(vars.add(variable().min(0.0)));
+    }
+
+    // Objective: sum of per-layer max(compute, io) + non-layer transfer costs
     let mut objective = Expression::from(0.0);
+    for j in 0..num_layers {
+        objective += layer_cost[j];
+    }
+
+    // Non-layer tensors: additive (no overlap possible — embedding, output head)
     for (i, t) in tensors.iter().enumerate() {
+        if t.layer_index.is_some() {
+            continue;
+        }
         let weight = t.size_bytes as f64 * t.access_freq;
         objective += x_gpu[i] * (weight / gpu_bw);
         objective += x_ram[i] * (weight / ram_bw);
@@ -328,6 +417,52 @@ fn lp_assign(
     }
 
     let mut problem = vars.minimise(objective).using(default_solver);
+
+    // Build per-layer compute and I/O expressions, then constrain layer_cost
+    let mut compute_exprs = Vec::with_capacity(num_layers);
+    let mut io_exprs = Vec::with_capacity(num_layers);
+
+    for j in 0..num_layers {
+        let layer_idx = layer_indices[j];
+        let mut compute_expr = Expression::from(0.0);
+        let mut io_expr = Expression::from(0.0);
+
+        for (i, t) in tensors.iter().enumerate() {
+            if t.layer_index != Some(layer_idx) {
+                continue;
+            }
+            let weight = t.size_bytes as f64 * t.access_freq;
+
+            // GPU and RAM transfers contribute to compute time
+            compute_expr += x_gpu[i] * (weight / gpu_bw);
+            compute_expr += x_ram[i] * (weight / ram_bw);
+
+            // NVMe transfers contribute to I/O time (with MoE cache-hit discount)
+            let eff_weight =
+                t.size_bytes as f64 * effective_io_freq(&t.role, t.access_freq, metadata.is_moe);
+            io_expr += x_nvme[i] * (eff_weight / nvme_bw);
+        }
+
+        // layer_cost[j] >= compute_time (linearization of max)
+        problem = problem.with(constraint!(layer_cost[j] >= compute_expr.clone()));
+        // layer_cost[j] >= io_time (for layer 0, no prefetch possible)
+        if j == 0 {
+            problem = problem.with(constraint!(layer_cost[j] >= io_expr.clone()));
+        }
+
+        compute_exprs.push(compute_expr);
+        io_exprs.push(io_expr);
+    }
+
+    // Cross-layer prefetch overlap: I/O of layer j is reduced by compute of layer j-1.
+    // layer_cost[j] >= io_j - compute_{j-1}
+    // Combined with layer_cost[j] >= 0 (from variable bound), this correctly models
+    // that prefetch starts during the previous layer's compute.
+    for j in 1..num_layers {
+        problem = problem.with(constraint!(
+            layer_cost[j] >= io_exprs[j].clone() - compute_exprs[j - 1].clone()
+        ));
+    }
 
     // Constraint: each tensor on exactly one tier
     for i in 0..n {
@@ -356,7 +491,6 @@ fn lp_assign(
     problem = problem.with(constraint!(unified_sum <= caps.unified_limit as f64));
 
     // Layer contiguity: monotonicity — once NVMe starts, it stays NVMe
-    // layer_nvme[L] >= layer_nvme[L-1] for consecutive layers
     for j in 1..num_layers {
         problem = problem.with(constraint!(layer_nvme[j] >= layer_nvme[j - 1]));
     }
@@ -477,23 +611,47 @@ fn quick_estimate(
     let total_experts = metadata.num_experts.unwrap_or(1);
 
     let mut total_latency_secs = 0.0;
+    let mut prev_compute_time = 0.0;
 
-    for t in tensors {
+    // Per-layer overlap model: max(compute, io - prev_compute)
+    for layer_idx in 0..metadata.num_layers {
+        let mut layer_compute = 0.0;
+        let mut layer_io = 0.0;
+
+        for t in tensors.iter().filter(|t| t.layer_index == Some(layer_idx)) {
+            let role = TensorRole::from_name(&t.name);
+            let freq = role.access_frequency(experts_per_token, total_experts);
+            let tier = assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
+
+            match tier {
+                StorageTier::Gpu => layer_compute += t.size_bytes as f64 * freq / gpu_bw,
+                StorageTier::Ram => layer_compute += t.size_bytes as f64 * freq / ram_bw,
+                StorageTier::Nvme => {
+                    let eff = effective_io_freq(&role, freq, metadata.is_moe);
+                    layer_io += t.size_bytes as f64 * eff / nvme_bw;
+                }
+            }
+        }
+
+        let effective_io = (layer_io - prev_compute_time).max(0.0);
+        let layer_latency = layer_compute.max(effective_io) + SYNC_OVERHEAD_PER_LAYER_US * 1e-6;
+        total_latency_secs += layer_latency;
+        prev_compute_time = layer_compute;
+    }
+
+    // Non-layer tensors (embedding, output head) — additive, no overlap
+    for t in tensors.iter().filter(|t| t.layer_index.is_none()) {
         let role = TensorRole::from_name(&t.name);
         let freq = role.access_frequency(experts_per_token, total_experts);
         let tier = assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
 
-        let transfer_time = match tier {
-            StorageTier::Gpu => t.size_bytes as f64 / gpu_bw,
-            StorageTier::Ram => t.size_bytes as f64 / ram_bw,
-            StorageTier::Nvme => t.size_bytes as f64 / nvme_bw,
+        let transfer = match tier {
+            StorageTier::Gpu => t.size_bytes as f64 * freq / gpu_bw,
+            StorageTier::Ram => t.size_bytes as f64 * freq / ram_bw,
+            StorageTier::Nvme => t.size_bytes as f64 * freq / nvme_bw,
         };
-
-        total_latency_secs += transfer_time * freq;
+        total_latency_secs += transfer;
     }
-
-    // Add sync overhead
-    total_latency_secs += metadata.num_layers as f64 * SYNC_OVERHEAD_PER_LAYER_US * 1e-6;
 
     if total_latency_secs > 0.0 {
         1.0 / total_latency_secs
@@ -587,6 +745,56 @@ mod tests {
         }
     }
 
+    fn make_hw() -> HardwareProfile {
+        use crate::profiler::types::*;
+        HardwareProfile {
+            timestamp: chrono::Utc::now(),
+            system: SystemInfo {
+                os: "test".into(),
+                arch: "arm64".into(),
+                machine_model: "test".into(),
+                total_cores: 10,
+            },
+            cpu: CpuProfile {
+                model_name: "Test CPU".into(),
+                cores_performance: 8,
+                cores_efficiency: 2,
+                has_amx: false,
+                has_neon: true,
+                has_avx512: false,
+                has_avx2: false,
+                int8_gflops: 0.0,
+            },
+            gpu: Some(GpuProfile {
+                name: "Test GPU".into(),
+                vram_bytes: 16 << 30,
+                bandwidth_bytes_per_sec: 200_000_000_000,
+                fp16_tflops: 0.0,
+                backend: GpuBackend::Metal,
+            }),
+            memory: MemoryProfile {
+                total_bytes: 32 << 30,
+                available_bytes: 28 << 30,
+                bandwidth_bytes_per_sec: 200_000_000_000,
+                is_unified: true,
+            },
+            storage: vec![StorageProfile {
+                device_path: "/dev/disk0".into(),
+                mount_point: "/".into(),
+                device_type: StorageType::NvmePcie,
+                capacity_bytes: 1 << 40,
+                free_bytes: 500 << 30,
+                sequential_read: BandwidthCurve {
+                    points: vec![],
+                    peak_sequential: 5_000_000_000,
+                },
+                random_read_iops: 0,
+                pcie_gen: None,
+                wear_level: None,
+            }],
+        }
+    }
+
     #[test]
     fn test_greedy_respects_capacity() {
         let tensors: Vec<ScoredTensor> = (0..10)
@@ -596,6 +804,7 @@ mod tests {
                 score: 10.0 - i as f64,
                 access_freq: 1.0,
                 layer_index: None,
+                role: TensorRole::Other(format!("tensor_{i}")),
             })
             .collect();
 
@@ -606,7 +815,9 @@ mod tests {
             nvme_peak_bw: 5_000_000_000,
         };
 
-        let assignments = greedy_assign(&tensors, &caps);
+        let hw = make_hw();
+        let meta = make_metadata(0);
+        let assignments = greedy_assign(&tensors, &caps, &hw, &meta);
 
         let gpu_count = assignments.values().filter(|t| **t == StorageTier::Gpu).count();
         let ram_count = assignments.values().filter(|t| **t == StorageTier::Ram).count();
@@ -626,6 +837,7 @@ mod tests {
                 score: 10.0 - i as f64,
                 access_freq: 1.0,
                 layer_index: Some(i as u32),
+                role: TensorRole::AttentionQuery,
             })
             .collect();
 
@@ -636,7 +848,9 @@ mod tests {
             nvme_peak_bw: 5_000_000_000,
         };
 
-        let assignments = greedy_assign(&tensors, &caps);
+        let hw = make_hw();
+        let meta = make_metadata(10);
+        let assignments = greedy_assign(&tensors, &caps, &hw, &meta);
 
         // Verify contiguity: no NVMe tensor has a lower layer than any GPU/RAM tensor
         let max_resident_layer = assignments
