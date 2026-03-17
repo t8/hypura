@@ -811,10 +811,17 @@ pub fn generate_with_nvme_scheduling(
     }
 
     // Eagerly prefetch NVMe layers before the first forward pass.
-    // Streaming modes: expert-streaming warms cache, dense FFN does nothing (loaded on demand).
     if expert_streaming {
         prefetch_state.warm_cache_from_coactivation();
-    } else if !dense_ffn_streaming {
+    } else if dense_ffn_streaming {
+        // Pre-load the first few layers' FFN data so the initial eval_callback
+        // doesn't stall. With 12 pool slots we can prime 4 layers.
+        for layer in 0..4.min(num_layers) {
+            if prefetch_state.dense_ffn_layouts.contains_key(&layer) {
+                prefetch_state.prefetch_dense_ffn(layer);
+            }
+        }
+    } else {
         prefetch_state.prefetch_all_nvme();
     }
 

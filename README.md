@@ -4,7 +4,7 @@
 
 Hypura is a storage-tier-aware LLM inference scheduler for Apple Silicon. It places model tensors across GPU (Metal), RAM, and NVMe based on access patterns and hardware bandwidth — enabling you to run models that exceed your available memory where vanilla llama.cpp would OOM or thrash to a halt.
 
-Run a 31 GB Mixtral 8x7B on a 32 GB Mac Mini at 2.2 tok/s. A 40 GB Llama 70B at 0.2 tok/s. Vanilla llama.cpp crashes on both.
+Run a 31 GB Mixtral 8x7B on a 32 GB Mac Mini at 2.2 tok/s. A 40 GB Llama 70B at 0.3 tok/s. Vanilla llama.cpp crashes on both.
 
 ## How it works
 
@@ -30,7 +30,7 @@ All benchmarks on **M1 Max, 32 GB unified memory, ~5.1 GB/s NVMe sequential read
 |---|---|---|---|---|---|---|---|
 | Qwen 2.5 14B Q4_K_M | 8.4 GB | 8.4 GB | — | full-resident | **21 tok/s** | ~21 tok/s | Fits in GPU; no overhead |
 | Mixtral 8x7B Q5_K_M | 30.9 GB | 1.1 GB | 29.8 GB | expert-streaming | **2.2 tok/s** | **OOM** | All layers on Metal; 99.5% cache hit rate |
-| Llama 3.3 70B Q4_K_M | 39.6 GB | 7.8 GB | 31.8 GB | dense-FFN-streaming | **0.2 tok/s** | **OOM** | All layers on Metal; I/O-bound (~50ms/layer) |
+| Llama 3.3 70B Q4_K_M | 39.6 GB | 7.8 GB | 31.8 GB | dense-FFN-streaming | **0.3 tok/s** | **OOM** | All layers on Metal; 3-layer prefetch lookahead |
 
 **Key takeaway:** For models that fit in memory, Hypura adds zero overhead. For models that don't fit, Hypura is the difference between "runs" and "crashes." Expert-streaming on Mixtral achieves usable interactive speeds by keeping only non-expert tensors on GPU and exploiting MoE sparsity (only 2/8 experts fire per token). Dense FFN-streaming extends this to non-MoE models like Llama 70B.
 

@@ -139,8 +139,8 @@ releases the previous layer's slots, and prefetches the next layer.
 | | Full-streaming (before) | Dense FFN-streaming (after) |
 |---|---|---|
 | **n_gpu_layers** | 47 (34 on CPU) | 81 (all Metal) |
-| **Generation** | 0.03 tok/s | **0.2 tok/s** |
-| **Improvement** | — | **6.7x** |
+| **Generation** | 0.03 tok/s | **0.3 tok/s** |
+| **Improvement** | — | **10x** |
 | **Per-token decode** | ~30s | ~6.5s (4s I/O + 2.5s compute) |
 | **Per-layer I/O** | ~300 MB/s effective | 6.6-9.9 GB/s (near peak) |
 
@@ -220,3 +220,4 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 - Keep-resident threshold: `gpu_committed_60% + buffer_bytes + 2.5GB overhead + nvme_bytes < RAM - 4GB`
 - This correctly enables keep-resident for Mixtral (26.3 GB < 28 GB) while
   forcing streaming for Llama 70B (33 + 9.8 GB >> 28 GB).
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |

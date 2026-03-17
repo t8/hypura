@@ -501,6 +501,73 @@ NVMe (FFN tensors) to use the custom buffer type. Non-FFN tensors stay on Metal.
 
 ---
 
+## Deeper Prefetch for Dense FFN-Streaming: IMPLEMENTED (2026-03-17)
+
+### Change 16: 3-layer prefetch lookahead + initial warm-up
+
+**Problem:** With +1 layer prefetch, every layer stalls ~20ms because I/O time (50ms) >
+compute time (30ms). The I/O pipe goes idle between prefetch submissions.
+
+**Theoretical ceiling:** With fully pipelined I/O, throughput is limited by the slower
+pipe: `max(total_compute, total_io)` = `max(2.4s, 4.1s)` = 4.1s → ~0.25 tok/s.
+
+#### Changes made:
+
+- `src/compute/nvme_backend.rs`:
+  - `activate_dense_ffn_pool()`: pool increased from 6 to 12 slots (4 layers × 3 tensors)
+  - `eval_callback_dense_ffn_streaming()`: after compute, prefetch +1/+2/+3 layers ahead
+    instead of just +1. Checks status to avoid duplicate submissions.
+  - `prefetch_dense_ffn()`: made `pub` for initial warm-up from inference.rs
+
+- `src/compute/inference.rs`:
+  - Before prompt eval, pre-load layers 0-3 FFN data into the pool so the first
+    eval_callback doesn't stall on a cold pool.
+
+#### Pool slot math:
+
+With 12 slots (4 layers × 3 FFN tensors):
+- Layer N computing: 3 slots
+- Layer N+1 prefetched (ready): 3 slots
+- Layer N+2 prefetching: 3 slots
+- Layer N-1 just released: 3 free slots → used for N+3
+
+Each step releases 1 layer (3 slots) and submits 1 new prefetch (3 slots). Balanced.
+
+Pool memory: 12 × 192.7 MB = 2.3 GB (was 1.16 GB). Still within the ~12 GB headroom.
+
+#### Status: VALIDATED (2026-03-17)
+
+### Results: Deeper prefetch on Llama 3.3 70B Q4_K_M
+
+| Metric | +1 prefetch (before) | +3 prefetch (after) | Change |
+|--------|---------------------|---------------------|--------|
+| **tok/s** | 0.20 | **0.30** | **+50%** |
+| Token 1 stalls | 157 (6643ms) | 72 (2540ms) | -54% |
+| Token 2 stalls | 79 (4272ms) | 29 (946ms) | -78% |
+| Token 3 stalls | 79 (4065ms) | 60 (2328ms) | -43% |
+| Token 2 decode | 6689ms | 2853ms | -57% |
+| Pool size | 1.16 GB (6 slots) | 2.31 GB (12 slots) | +1.15 GB |
+
+**Token 2 is the standout:** only 29 stalls (946ms I/O wait), decode dropped from 6.7s to
+2.9s. The deeper prefetch successfully hides most I/O behind compute for this token.
+
+**Token 3 regressed vs token 2:** 60 stalls (2328ms), 4.7s decode. The per-layer trace
+shows a bimodal pattern: some layers stall 3-15ms (well-prefetched) while others stall
+50-70ms (pipe fell behind). This suggests the I/O pipe is getting disrupted at the token
+boundary — possibly because `prefetch_all_nvme()` or the token-boundary callback reset
+interferes with the in-flight prefetch pipeline.
+
+#### Investigation needed: token 3 regression
+
+The token 2 → token 3 regression suggests the prefetch pipeline isn't restarting cleanly
+between tokens. Possible causes:
+1. Token boundary code in `generate_with_nvme_scheduling` calls `prefetch_all_nvme()` which
+   may conflict with the eval_callback's per-layer prefetch
+2. Pool slot eviction at token boundary — releasing all layers then re-prefetching from scratch
+3. `current_layer` atomic reset between tokens causes the callback to misidentify layer transitions
+
+---
+
 ## Next Optimizations (post expert-streaming)
 
 ### Change 11: Increase n_batch for Expert-Streaming Prompt Eval
@@ -660,8 +727,8 @@ cargo run --release -- iobench ./test-models/mixtral-8x7b-instruct-v0.1.Q5_K_M.g
 Current baselines (2026-03-17):
 - Mixtral expert-streaming: **2.19 tok/s** (was 0.87 keep-resident)
 - Mixtral prompt eval (n_batch=1): 4.5s for 9 tokens (target: <1s with n_batch tuning)
-- Llama 70B dense-FFN-streaming: **0.20 tok/s** (was 0.03 FullStreaming — **6.7x improvement**)
-- Llama 70B per-token decode: ~6.5s (4s I/O stalls + 2.5s compute)
+- Llama 70B dense-FFN-streaming: **0.30 tok/s** (was 0.03 FullStreaming — **10x improvement**)
+- Llama 70B per-token decode: ~2.9s best (token 2), ~4.7s worst (token 3, pipeline disruption)
 - Raw I/O (MT + F_NOCACHE + MADV_FREE): 6.8 GB/s
 - Neuron cache hit rate: 99.5% (expert-streaming Mixtral)
 

@@ -1138,8 +1138,8 @@ impl PrefetchState {
         }
     }
 
-    /// Non-blocking prefetch of next layer's dense FFN tensors into pool slots.
-    fn prefetch_dense_ffn(&self, layer_idx: u32) {
+    /// Non-blocking prefetch of a layer's dense FFN tensors into pool slots.
+    pub fn prefetch_dense_ffn(&self, layer_idx: u32) {
         let layouts = match self.dense_ffn_layouts.get(&layer_idx) {
             Some(l) if !l.is_empty() => l,
             _ => return,
@@ -1981,8 +1981,8 @@ impl HypuraBuftController {
 
         anyhow::ensure!(slot_size > 0, "No FFN tensors found");
 
-        // 6 slots: 2 layers × 3 FFN tensors (double-buffering for prefetch)
-        let num_slots = 6;
+        // 12 slots: 4 layers × 3 FFN tensors (current + 3 prefetched ahead)
+        let num_slots = 12;
         let pool_size = num_slots * slot_size;
 
         tracing::info!(
@@ -2327,16 +2327,28 @@ fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask:
             }
         }
 
-        // Prefetch next layer's FFN data (double-buffering)
-        let next = layer_idx + 1;
-        if next < state.num_layers && state.dense_ffn_layouts.contains_key(&next) {
+        // Prefetch ahead: submit I/O for the next 3 FFN layers so the I/O pipe
+        // stays busy continuously. With 12 pool slots (4 layers × 3 tensors),
+        // we can hold current + 3 prefetched layers simultaneously.
+        {
             let status = state.layer_status.lock().unwrap();
-            if status.get(&next).copied() != Some(LayerStatus::Loaded)
-                && status.get(&next).copied() != Some(LayerStatus::Loading)
-            {
-                drop(status);
-                // Non-blocking: allocate slots and start I/O, don't wait
-                state.prefetch_dense_ffn(next);
+            let mut to_prefetch = Vec::new();
+            for lookahead in 1..=3 {
+                let target = layer_idx + lookahead;
+                if target >= state.num_layers {
+                    break;
+                }
+                if !state.dense_ffn_layouts.contains_key(&target) {
+                    continue;
+                }
+                let s = status.get(&target).copied();
+                if s != Some(LayerStatus::Loaded) && s != Some(LayerStatus::Loading) {
+                    to_prefetch.push(target);
+                }
+            }
+            drop(status);
+            for target in to_prefetch {
+                state.prefetch_dense_ffn(target);
             }
         }
     }
