@@ -10,6 +10,10 @@ struct AppleSiliconSpec {
 
 // Ordered specific-first: "M2 Max" before "M2"
 const APPLE_SILICON_SPECS: &[AppleSiliconSpec] = &[
+    AppleSiliconSpec { pattern: "M5 Ultra", bandwidth_gb_s: 900.0, fp16_tflops: 40.0 },
+    AppleSiliconSpec { pattern: "M5 Max",   bandwidth_gb_s: 600.0, fp16_tflops: 20.0 },
+    AppleSiliconSpec { pattern: "M5 Pro",   bandwidth_gb_s: 300.0, fp16_tflops: 10.0 },
+    AppleSiliconSpec { pattern: "M5",       bandwidth_gb_s: 120.0, fp16_tflops: 4.5  },
     AppleSiliconSpec { pattern: "M4 Ultra", bandwidth_gb_s: 819.0, fp16_tflops: 36.0 },
     AppleSiliconSpec { pattern: "M4 Max",   bandwidth_gb_s: 546.0, fp16_tflops: 18.0 },
     AppleSiliconSpec { pattern: "M4 Pro",   bandwidth_gb_s: 273.0, fp16_tflops: 9.0  },

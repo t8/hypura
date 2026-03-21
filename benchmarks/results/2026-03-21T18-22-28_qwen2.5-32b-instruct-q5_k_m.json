@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-03-21T18:22:28.508063+00:00",
+  "model": {
+    "name": "qwen2.5-32b-instruct-q5_k_m",
+    "architecture": "qwen2",
+    "params": "32.8B",
+    "quant": "Q5K",
+    "size_gb": 21.65900421142578
+  },
+  "hardware": {
+    "cpu": "Apple M5 Pro",
+    "ram_gb": 24.0,
+    "gpu": "Apple M5 Pro",
+    "nvme_seq_gbps": 33.401559325
+  },
+  "placement": {
+    "gpu_gb": 3.6963577270507812,
+    "ram_gb": 0.0,
+    "nvme_gb": 17.962646484375
+  },
+  "config": {
+    "context": 2048,
+    "max_tokens": 30,
+    "prompt": "Write a short paragraph about artificial intelligence.",
+    "n_gpu_layers": 65
+  },
+  "baseline": null,
+  "hypura": {
+    "prompt_eval_ms": 2633.18375,
+    "tok_per_sec": 0.6311565552513736,
+    "tokens_generated": 30,
+    "wall_time_ms": 52698.507625
+  },
+  "speedup": null
+}

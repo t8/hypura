@@ -40,20 +40,30 @@ Models that fit in memory run at full Metal GPU speed with zero overhead.
 
 ## Hardware
 
-All benchmarks run on:
+Benchmarks run on:
 
-- **CPU/GPU:** Apple M1 Max (10-core, 32-core GPU)
-- **Memory:** 32 GB unified (LPDDR5, ~400 GB/s bandwidth)
-- **Storage:** Apple NVMe (~5.1 GB/s sequential read)
+- **M1 Max 32GB:** Apple M1 Max (10-core, 32-core GPU), 32 GB unified (LPDDR5, ~400 GB/s), NVMe ~5.1 GB/s seq read
+- **M5 Pro 24GB:** Apple M5 Pro (5P+10E cores), 24 GB unified, NVMe ~33.4 GB/s seq read
 
 ## Results
 
+### M1 Max 32GB
+
 | Date | Model | Params | Quant | Size | Mode | GPU | NVMe | Hypura tok/s | Baseline | Notes |
 |------|-------|--------|-------|------|------|-----|------|--------------|----------|-------|
-| 2026-03-13 | TinyLlama 1.1B | 1.1B | Q4_K_M | 0.6 GB | full-resident | 0.6 GB | — | 71.8 | — | Fits in GPU |
-| 2026-03-14 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 24.0 | — | Fits in GPU |
+| 2026-03-21 | TinyLlama 1.1B | 1.1B | Q4_K_M | 0.6 GB | full-resident | 0.6 GB | — | 147.9 | 144.9 | 1.0x, fits in GPU |
+| 2026-03-21 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 12.3 | 8.9 | 1.4x, fits in GPU |
 | 2026-03-17 | Mixtral 8x7B | 46.7B | Q5_K_M | 30.9 GB | expert-streaming | 1.1 GB | 29.8 GB | **2.2** | OOM | 99.5% neuron cache hit rate |
-| 2026-03-17 | Llama 3.3 70B | 70.6B | Q4_K_M | 39.6 GB | dense-FFN-streaming | 7.8 GB | 31.8 GB | **0.2** | OOM | All layers on Metal, I/O-bound |
+| 2026-03-17 | Llama 3.3 70B | 70.6B | Q4_K_M | 39.6 GB | dense-FFN-streaming | 7.8 GB | 31.8 GB | **0.3** | OOM | All layers on Metal, I/O-bound |
+
+### M5 Pro 24GB
+
+| Date | Model | Params | Quant | Size | Mode | GPU | NVMe | Hypura tok/s | Baseline | Notes |
+|------|-------|--------|-------|------|------|-----|------|--------------|----------|-------|
+| 2026-03-21 | TinyLlama 1.1B | 1.1B | Q4_K_M | 0.6 GB | full-resident | 0.6 GB | — | 268.3 | 250.9 | 1.1x, fits in GPU |
+| 2026-03-21 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 27.2 | 27.2 | 1.0x, fits in GPU |
+| 2026-03-21 | Qwen 2.5 32B | 32.8B | Q5_K_M | 21.7 GB | dense-FFN-streaming | 3.7 GB | 18.0 GB | **0.6** | OOM | FFN on NVMe |
+| 2026-03-21 | Mixtral 8x7B | 46.7B | Q5_K_M | 30.9 GB | expert-streaming | 1.1 GB | 29.8 GB | **2.7** | OOM | Expert streaming |
 
 ### Key observations
 
@@ -220,21 +230,3 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 - Keep-resident threshold: `gpu_committed_60% + buffer_bytes + 2.5GB overhead + nvme_bytes < RAM - 4GB`
 - This correctly enables keep-resident for Mixtral (26.3 GB < 28 GB) while
   forcing streaming for Llama 70B (33 + 9.8 GB >> 28 GB).
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.1 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.1 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
-| 2026-03-17 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.9 | — |
-| 2026-03-17 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.9 | — |
-| 2026-03-17 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.9 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.2 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.1 | — |
-| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
-| 2026-03-21 | tinyllama-1.1b-q4_k_m Q4K | Apple M1 Max 32GB | 0.6 GB | 0.0 GB | 0.0 GB | 102.8 | 148.3 | 1.4x |
-| 2026-03-21 | tinyllama-1.1b-q4_k_m Q4K | Apple M1 Max 32GB | 0.6 GB | 0.0 GB | 0.0 GB | 144.9 | 147.9 | 1.0x |
-| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 8.9 | 12.3 | 1.4x |
-| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 9.7 | 11.1 | 1.2x |
-| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | — | 9.5 | — |
-| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | — | 8.9 | — |
-| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 8.6 | 11.9 | 1.4x |

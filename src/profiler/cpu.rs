@@ -29,6 +29,10 @@ pub fn profile_cpu() -> anyhow::Result<CpuProfile> {
 fn estimate_int8_gflops(model_name: &str) -> f64 {
     // Ordered specific-first so "M4 Max" matches before "M4"
     let specs: &[(&str, f64)] = &[
+        ("M5 Ultra", 44.0),
+        ("M5 Max", 22.0),
+        ("M5 Pro", 11.0),
+        ("M5", 5.5),
         ("M4 Ultra", 40.0),
         ("M4 Max", 20.0),
         ("M4 Pro", 10.0),
