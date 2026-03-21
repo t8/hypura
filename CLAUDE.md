@@ -34,21 +34,25 @@ cargo run --release -- bench --baseline ./test-models/model.gguf  # A/B comparis
 
 ## Benchmark charts
 
-ASCII charts are auto-generated from JSON results in `benchmarks/results/`.
+Chart images are auto-generated from JSON results using matplotlib.
 
 ```sh
 # Run benchmarks (saves JSON to benchmarks/results/)
 cargo run --release -- bench --max-tokens 30 ./test-models/model.gguf
 
-# Regenerate charts from all results
+# Regenerate chart images from all results
+pip3 install matplotlib  # one-time setup
 ./benchmarks/gen_charts.sh
 
-# Charts are written to benchmarks/CHARTS.md
+# Output:
+#   benchmarks/charts/*.png  — chart images (committed to repo)
+#   benchmarks/CHARTS.md     — markdown referencing the images
 ```
 
 The script picks the best tok/s per model per machine, so results from multiple
 machines accumulate. To add your machine's results: run benchmarks, commit the
 JSON files in `benchmarks/results/`, then run `gen_charts.sh` to update the charts.
+Commit the updated PNGs and CHARTS.md.
 
 ## Safety
 
