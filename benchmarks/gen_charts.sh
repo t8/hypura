@@ -115,40 +115,61 @@ plt.rcParams.update({
     "font.size": 12,
 })
 
-# --- Chart 1: Generation speed ---
+# --- Chart 1: Generation speed (Hypura vs baseline) ---
 
-fig, ax = plt.subplots(figsize=(10, max(3, len(entries) * 0.9 + 1.2)))
+from matplotlib.patches import Patch
+
+fig, ax = plt.subplots(figsize=(10, max(3, len(entries) * 1.1 + 1.5)))
 
 models = []
-tps_vals = []
+hypura_vals = []
+baseline_vals = []
 colors = []
 for r in entries:
     model = short_model(r["model"]["name"])
     size = format_size(r["model"]["size_gb"])
     exceeds = r["model"]["size_gb"] > r["hardware"]["ram_gb"] - 4
     models.append(f"{model}\n({size})")
-    tps_vals.append(r["hypura"]["tok_per_sec"])
+    hypura_vals.append(r["hypura"]["tok_per_sec"])
+    bl = r.get("baseline")
+    baseline_vals.append(bl["tok_per_sec"] if bl and bl.get("tok_per_sec", 0) > 0 else 0)
     colors.append(RED if exceeds else GREEN)
 
-bars = ax.barh(range(len(models)), tps_vals, color=colors, height=0.6, edgecolor=BORDER)
+y = range(len(models))
+bar_h = 0.35
 
-for i, (bar, tps) in enumerate(zip(bars, tps_vals)):
-    offset = max(tps * 0.02, 0.3)
-    ax.text(tps + offset, i, f"{tps:.1f}", va="center", ha="left",
-            fontsize=11, fontweight="bold", color=FG)
+# Baseline bars (behind, gray)
+for i in y:
+    if baseline_vals[i] > 0:
+        ax.barh(i + bar_h/2, baseline_vals[i], height=bar_h,
+                color="#484f58", edgecolor=BORDER, zorder=1)
+        offset = max(baseline_vals[i] * 0.02, 0.3)
+        ax.text(baseline_vals[i] + offset, i + bar_h/2, f"{baseline_vals[i]:.1f}",
+                va="center", fontsize=9, color="#8b949e")
+    elif colors[i] == RED:
+        ax.text(0.5, i + bar_h/2, "OOM", va="center", fontsize=9,
+                color=RED, fontstyle="italic")
 
-ax.set_yticks(range(len(models)))
+# Hypura bars (front, colored)
+for i in y:
+    ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
+            color=colors[i], edgecolor=BORDER, zorder=2)
+    offset = max(hypura_vals[i] * 0.02, 0.3)
+    ax.text(hypura_vals[i] + offset, i - bar_h/2, f"{hypura_vals[i]:.1f}",
+            va="center", fontsize=10, fontweight="bold", color=FG)
+
+ax.set_yticks(list(y))
 ax.set_yticklabels(models, fontsize=10)
 ax.set_xlabel("tok/s (higher is better)", fontsize=11)
-ax.set_title("Generation Speed", fontsize=14, fontweight="bold", pad=12)
+ax.set_title("Generation Speed: Hypura vs llama.cpp", fontsize=14, fontweight="bold", pad=12)
 ax.grid(axis="x", alpha=0.3)
-ax.set_xlim(0, max(tps_vals) * 1.18)
+all_vals = hypura_vals + [v for v in baseline_vals if v > 0]
+ax.set_xlim(0, max(all_vals) * 1.18)
 
-# Legend
-from matplotlib.patches import Patch
 legend_elements = [
-    Patch(facecolor=GREEN, edgecolor=BORDER, label="Fits in memory"),
-    Patch(facecolor=RED, edgecolor=BORDER, label="Exceeds RAM (llama.cpp = OOM)"),
+    Patch(facecolor=GREEN, edgecolor=BORDER, label="Hypura (fits in memory)"),
+    Patch(facecolor=RED, edgecolor=BORDER, label="Hypura (exceeds RAM)"),
+    Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"),
 ]
 ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
           facecolor=BG, edgecolor=BORDER, labelcolor=FG)

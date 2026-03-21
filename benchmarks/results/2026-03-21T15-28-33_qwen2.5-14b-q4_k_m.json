@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-14T04:21:21.108779+00:00",
+  "timestamp": "2026-03-21T15:28:33.166523+00:00",
   "model": {
     "name": "qwen2.5-14b-q4_k_m",
     "architecture": "qwen2",
@@ -20,16 +20,21 @@
   },
   "config": {
     "context": 2048,
-    "max_tokens": 64,
+    "max_tokens": 30,
     "prompt": "Write a short paragraph about artificial intelligence.",
     "n_gpu_layers": 49
   },
-  "baseline": null,
-  "hypura": {
-    "prompt_eval_ms": 107.37112499999999,
-    "tok_per_sec": 24.00942707645319,
-    "tokens_generated": 64,
-    "wall_time_ms": 6668.94325
+  "baseline": {
+    "prompt_eval_ms": 326.71937499999996,
+    "tok_per_sec": 8.904976003764132,
+    "tokens_generated": 30,
+    "wall_time_ms": 10864.119041
   },
-  "speedup": null
+  "hypura": {
+    "prompt_eval_ms": 2.8800000000000003,
+    "tok_per_sec": 12.346216301388425,
+    "tokens_generated": 30,
+    "wall_time_ms": 3767.071959
+  },
+  "speedup": 1.3864401539285094
 }

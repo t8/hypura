@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-17T06:44:32.937637+00:00",
+  "timestamp": "2026-03-17T23:05:42.228706+00:00",
   "model": {
     "name": "mixtral-8x7b-instruct-v0.1.Q5_K_M",
     "architecture": "llama",
@@ -14,22 +14,22 @@
     "nvme_seq_gbps": 5.093685141
   },
   "placement": {
-    "gpu_gb": 22.89636993408203,
-    "ram_gb": 6.97607421875,
-    "nvme_gb": 1.0743255615234375
+    "gpu_gb": 1.1420822143554688,
+    "ram_gb": 0.0,
+    "nvme_gb": 29.8046875
   },
   "config": {
-    "context": 512,
-    "max_tokens": 2,
+    "context": 2048,
+    "max_tokens": 30,
     "prompt": "Write a short paragraph about artificial intelligence.",
-    "n_gpu_layers": 24
+    "n_gpu_layers": 33
   },
   "baseline": null,
   "hypura": {
-    "prompt_eval_ms": 1404.515583,
-    "tok_per_sec": 1.1328269313743358,
-    "tokens_generated": 2,
-    "wall_time_ms": 14335.231958
+    "prompt_eval_ms": 1193.220375,
+    "tok_per_sec": 1.9255766908138996,
+    "tokens_generated": 30,
+    "wall_time_ms": 30236.245042
   },
   "speedup": null
 }

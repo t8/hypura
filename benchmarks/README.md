@@ -221,3 +221,18 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 - This correctly enables keep-resident for Mixtral (26.3 GB < 28 GB) while
   forcing streaming for Llama 70B (33 + 9.8 GB >> 28 GB).
 | 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.1 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.1 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
+| 2026-03-17 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.9 | — |
+| 2026-03-17 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.9 | — |
+| 2026-03-17 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.9 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.2 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.1 | — |
+| 2026-03-17 | llama-3.3-70b-q4_k_m Q4K | Apple M1 Max 32GB | 7.8 GB | 0.0 GB | 31.8 GB | — | 0.3 | — |
+| 2026-03-21 | tinyllama-1.1b-q4_k_m Q4K | Apple M1 Max 32GB | 0.6 GB | 0.0 GB | 0.0 GB | 102.8 | 148.3 | 1.4x |
+| 2026-03-21 | tinyllama-1.1b-q4_k_m Q4K | Apple M1 Max 32GB | 0.6 GB | 0.0 GB | 0.0 GB | 144.9 | 147.9 | 1.0x |
+| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 8.9 | 12.3 | 1.4x |
+| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 9.7 | 11.1 | 1.2x |
+| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | — | 9.5 | — |

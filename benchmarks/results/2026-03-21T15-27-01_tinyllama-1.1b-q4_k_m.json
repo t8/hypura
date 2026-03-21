@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-13T17:59:17.175878+00:00",
+  "timestamp": "2026-03-21T15:27:01.561794+00:00",
   "model": {
     "name": "tinyllama-1.1b-q4_k_m",
     "architecture": "llama",
@@ -20,16 +20,21 @@
   },
   "config": {
     "context": 2048,
-    "max_tokens": 20,
+    "max_tokens": 30,
     "prompt": "Write a short paragraph about artificial intelligence.",
-    "n_gpu_layers": 22
+    "n_gpu_layers": 23
   },
-  "baseline": null,
+  "baseline": {
+    "prompt_eval_ms": 4.199416,
+    "tok_per_sec": 144.87991413411788,
+    "tokens_generated": 30,
+    "wall_time_ms": 368.58299999999997
+  },
   "hypura": {
-    "prompt_eval_ms": 153.85875,
-    "tok_per_sec": 71.79180385497075,
-    "tokens_generated": 20,
-    "wall_time_ms": 937.579792
+    "prompt_eval_ms": 1.1247500000000001,
+    "tok_per_sec": 147.89881995229032,
+    "tokens_generated": 30,
+    "wall_time_ms": 324.159584
   },
-  "speedup": null
+  "speedup": 1.0208372971244157
 }
