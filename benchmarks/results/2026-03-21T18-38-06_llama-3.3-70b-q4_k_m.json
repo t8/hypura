@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-03-21T18:38:06.499567+00:00",
+  "model": {
+    "name": "llama-3.3-70b-q4_k_m",
+    "architecture": "llama",
+    "params": "70.6B",
+    "quant": "Q4K",
+    "size_gb": 39.59288048744202
+  },
+  "hardware": {
+    "cpu": "Apple M5 Pro",
+    "ram_gb": 24.0,
+    "gpu": "Apple M5 Pro",
+    "nvme_seq_gbps": 33.401559325
+  },
+  "placement": {
+    "gpu_gb": 7.805771112442017,
+    "ram_gb": 0.0,
+    "nvme_gb": 31.787109375
+  },
+  "config": {
+    "context": 2048,
+    "max_tokens": 30,
+    "prompt": "Write a short paragraph about artificial intelligence.",
+    "n_gpu_layers": 81
+  },
+  "baseline": null,
+  "hypura": {
+    "prompt_eval_ms": 5045.187792,
+    "tok_per_sec": 0.320334208096205,
+    "tokens_generated": 30,
+    "wall_time_ms": 103340.429167
+  },
+  "speedup": null
+}

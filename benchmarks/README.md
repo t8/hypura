@@ -64,6 +64,7 @@ Benchmarks run on:
 | 2026-03-21 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 27.2 | 27.2 | 1.0x, fits in GPU |
 | 2026-03-21 | Qwen 2.5 32B | 32.8B | Q5_K_M | 21.7 GB | dense-FFN-streaming | 3.7 GB | 18.0 GB | **0.6** | OOM | FFN on NVMe |
 | 2026-03-21 | Mixtral 8x7B | 46.7B | Q5_K_M | 30.9 GB | expert-streaming | 1.1 GB | 29.8 GB | **2.7** | OOM | Expert streaming |
+| 2026-03-21 | Llama 3.3 70B | 70.6B | Q4_K_M | 39.6 GB | dense-FFN-streaming | 7.8 GB | 31.8 GB | **0.3** | OOM | All layers on Metal, I/O-bound |
 
 ### Key observations
 
