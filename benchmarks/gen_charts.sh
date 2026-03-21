@@ -100,6 +100,8 @@ def model_base_name(name):
     """Extract base model family name for color grouping."""
     n = name.lower()
     if "tinyllama" in n: return "tinyllama"
+    if "qwen3-coder-next" in n or "qwen3-coder-next" in n.replace(" ", "-"): return "qwen3-coder-next"
+    if "qwen" in n and "coder" in n and "32b" in n: return "qwen-coder-32b"
     if "qwen" in n and "32b" in n: return "qwen-32b"
     if "qwen" in n and "14b" in n: return "qwen-14b"
     if "qwen" in n: return "qwen"
@@ -110,11 +112,13 @@ def model_base_name(name):
 
 # Distinct colors per model family (colorblind-friendly palette)
 MODEL_COLORS = {
-    "tinyllama": "#7ee787",   # green
-    "qwen-14b":  "#58a6ff",   # blue
-    "qwen-32b":  "#bc8cff",   # purple
-    "mixtral":   "#f0883e",   # orange
-    "llama-70b": "#f778ba",   # pink
+    "tinyllama":         "#7ee787",   # green
+    "qwen-14b":          "#58a6ff",   # blue
+    "qwen-32b":          "#bc8cff",   # purple
+    "qwen-coder-32b":    "#d2a8ff",   # light purple
+    "qwen3-coder-next":  "#79c0ff",   # light blue
+    "mixtral":           "#f0883e",   # orange
+    "llama-70b":         "#f778ba",   # pink
 }
 MODEL_COLOR_DEFAULT = "#8b949e"  # gray fallback
 

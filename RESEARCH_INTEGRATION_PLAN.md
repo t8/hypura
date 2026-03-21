@@ -799,9 +799,18 @@ The iobench proves the raw I/O path achieves 6.8 GB/s. The 300 MB/s effective th
 - **Changes 8-10** — SUPERSEDED by expert-streaming
 - **Change 11** (n_batch tuning) — DONE (n_batch=1 cap removed in earlier session, Mixtral prompt eval 4.5s → 1.2s)
 
-**Pending benchmark:** Qwen 2.5 32B Q5_K_M (21.7 GB) on M1 Max 32 GB. Should trigger
-keep-resident or light NVMe spill. Test command:
-`cargo run --release -- bench --max-tokens 30 --context 2048 ./test-models/qwen2.5-32b-instruct-q5_k_m.gguf`
+**Pending benchmarks (2026-03-21):**
+
+1. **Qwen3-Coder-Next 80B-A3B Q4_K_M** (~45.2 GB) — MoE with 512 experts, 10 active
+   (2% activation ratio). Should trigger expert-streaming. Extreme sparsity should give
+   very high neuron cache hit rate. Key test of expert-streaming on high-expert-count models.
+   `cargo run --release -- bench --max-tokens 10 --context 512 ./test-models/Qwen3-Coder-Next-Q4_K_M.gguf`
+
+2. **Qwen 2.5 Coder 32B Q8_0** (~32.4 GB) — Dense, most popular coding model at max
+   quality quant. Q8 exceeds 32 GB RAM. Should trigger dense FFN-streaming.
+   `cargo run --release -- bench --max-tokens 10 --context 512 ./test-models/qwen2.5-coder-32b-instruct-q8_0.gguf`
+
+   **If either crashes, start with `--max-tokens 3` and verify placement/mode selection first.**
 - **Change 12** (warm cache) — planned
 - **Change 13** (dense FFN-streaming) — DONE: 0.20 tok/s (6.7x over FullStreaming 0.03). Bottleneck is per-layer I/O stalls (~50ms × 80 layers)
 - **Change 14** (pool/cache tuning) — DONE: unified MemoryBudget, dynamic pool slots, scaled prefetch lookahead
