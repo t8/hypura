@@ -236,3 +236,5 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 | 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 8.9 | 12.3 | 1.4x |
 | 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 9.7 | 11.1 | 1.2x |
 | 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | — | 9.5 | — |
+| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | — | 8.9 | — |
+| 2026-03-21 | qwen2.5-14b-q4_k_m Q4K | Apple M1 Max 32GB | 8.4 GB | 0.0 GB | 0.0 GB | 8.6 | 11.9 | 1.4x |

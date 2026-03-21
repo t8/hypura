@@ -212,11 +212,15 @@ ax.set_title("Memory Placement by Tier", fontsize=14, fontweight="bold", pad=12)
 ax.grid(axis="x", alpha=0.3)
 ax.set_xlim(0, max(r["model"]["size_gb"] for r in entries) * 1.45)
 
+has_ram = any(r["placement"]["ram_gb"] > 0.01 for r in entries)
 legend_elements = [
     Patch(facecolor=GPU_COLOR, edgecolor=BORDER, label="GPU (Metal)"),
-    Patch(facecolor=RAM_COLOR, edgecolor=BORDER, label="RAM"),
-    Patch(facecolor=NVME_COLOR, edgecolor=BORDER, label="NVMe"),
 ]
+if has_ram:
+    legend_elements.append(Patch(facecolor=RAM_COLOR, edgecolor=BORDER, label="RAM"))
+has_nvme = any(r["placement"]["nvme_gb"] > 0.01 for r in entries)
+if has_nvme:
+    legend_elements.append(Patch(facecolor=NVME_COLOR, edgecolor=BORDER, label="NVMe"))
 ax.legend(handles=legend_elements, loc="upper right", fontsize=9,
           facecolor=BG, edgecolor=BORDER, labelcolor=FG)
 
