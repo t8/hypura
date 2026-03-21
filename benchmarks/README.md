@@ -53,8 +53,10 @@ Benchmarks run on:
 |------|-------|--------|-------|------|------|-----|------|--------------|----------|-------|
 | 2026-03-21 | TinyLlama 1.1B | 1.1B | Q4_K_M | 0.6 GB | full-resident | 0.6 GB | — | 147.9 | 144.9 | 1.0x, fits in GPU |
 | 2026-03-21 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 12.3 | 8.9 | 1.4x, fits in GPU |
+| 2026-03-21 | Qwen 2.5 32B | 32.8B | Q5_K_M | 21.7 GB | full-resident | 21.7 GB | — | 6.6 | — | Fits in GPU |
 | 2026-03-17 | Mixtral 8x7B | 46.7B | Q5_K_M | 30.9 GB | expert-streaming | 1.1 GB | 29.8 GB | **2.2** | OOM | 99.5% neuron cache hit rate |
 | 2026-03-17 | Llama 3.3 70B | 70.6B | Q4_K_M | 39.6 GB | dense-FFN-streaming | 7.8 GB | 31.8 GB | **0.3** | OOM | All layers on Metal, I/O-bound |
+| 2026-03-21 | Qwen3-Coder-Next | 79.7B | Q4_K_M | 45.2 GB | expert-streaming | 1.6 GB | 43.6 GB | **1.3** | OOM | MoE 80B-A3B, expert streaming |
 
 ### M5 Pro 24GB
 
@@ -62,7 +64,6 @@ Benchmarks run on:
 |------|-------|--------|-------|------|------|-----|------|--------------|----------|-------|
 | 2026-03-21 | TinyLlama 1.1B | 1.1B | Q4_K_M | 0.6 GB | full-resident | 0.6 GB | — | 268.3 | 250.9 | 1.1x, fits in GPU |
 | 2026-03-21 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 27.2 | 27.2 | 1.0x, fits in GPU |
-| 2026-03-21 | Qwen 2.5 32B | 32.8B | Q5_K_M | 21.7 GB | dense-FFN-streaming | 3.7 GB | 18.0 GB | **0.6** | OOM | FFN on NVMe |
 | 2026-03-21 | Mixtral 8x7B | 46.7B | Q5_K_M | 30.9 GB | expert-streaming | 1.1 GB | 29.8 GB | **2.7** | OOM | Expert streaming |
 | 2026-03-21 | Qwen3-Coder-Next | 79.7B | Q4_K_M | 45.2 GB | expert-streaming | 1.6 GB | 43.6 GB | **1.3** | OOM | MoE 80B-A3B, expert streaming |
 | 2026-03-21 | Llama 3.3 70B | 70.6B | Q4_K_M | 39.6 GB | dense-FFN-streaming | 7.8 GB | 31.8 GB | **0.3** | OOM | All layers on Metal, I/O-bound |
@@ -232,9 +233,3 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 - Keep-resident threshold: `gpu_committed_60% + buffer_bytes + 2.5GB overhead + nvme_bytes < RAM - 4GB`
 - This correctly enables keep-resident for Mixtral (26.3 GB < 28 GB) while
   forcing streaming for Llama 70B (33 + 9.8 GB >> 28 GB).
-| 2026-03-21 | qwen2.5-32b-instruct-q5_k_m Q5K | Apple M1 Max 32GB | 21.7 GB | 0.0 GB | 0.0 GB | — | 6.6 | — |
-| 2026-03-21 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 1.6 GB | 0.0 GB | 43.6 GB | — | 1.3 | — |
-| 2026-03-21 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 1.6 GB | 0.0 GB | 43.6 GB | — | 1.0 | — |
-| 2026-03-21 | qwen2.5-coder-32b-instruct-q8_0 Q8_0 | Apple M1 Max 32GB | 5.5 GB | 0.0 GB | 26.9 GB | — | 0.1 | — |
-| 2026-03-21 | qwen2.5-coder-32b-instruct-q8_0 Q8_0 | Apple M1 Max 32GB | 5.5 GB | 0.0 GB | 26.9 GB | — | 0.2 | — |
-| 2026-03-21 | qwen2.5-coder-32b-instruct-q8_0 Q8_0 | Apple M1 Max 32GB | 5.5 GB | 0.0 GB | 26.9 GB | — | 0.3 | — |
