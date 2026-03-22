@@ -177,6 +177,16 @@ Hypura is a Cargo workspace with two crates:
 | `cli/bench.rs` | A/B benchmark harness |
 | `model/tensor_role.rs` | Tensor classification for placement scoring (norms, attention, MoE experts) |
 
+## FAQ
+
+### Will this kill my SSD?
+
+No. **Hypura only reads from your SSD during inference — it never writes to it.**
+
+SSD wear is caused by write cycles (program/erase cycles on NAND flash cells). Reads do not degrade flash cells. Hypura's entire NVMe I/O path uses read-only `pread()` calls with `F_NOCACHE` to stream tensor weights from the GGUF file into RAM/GPU memory pools, where all computation happens. The SSD is used as cold storage, not as working memory.
+
+The only writes Hypura performs are negligible: benchmark result JSON files (~KB), co-activation statistics (~KB to `~/.hypura/`), and the one-time `hypura optimize` command if you choose to run it. Normal inference generates zero SSD writes.
+
 ## Safety notes
 
 - `bench --baseline` is blocked when the model exceeds RAM minus 4 GB headroom. Use `--force` to override at your own risk.

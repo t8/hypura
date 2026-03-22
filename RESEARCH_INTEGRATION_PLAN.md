@@ -799,6 +799,38 @@ The iobench proves the raw I/O path achieves 6.8 GB/s. The 300 MB/s effective th
 - **Changes 8-10** — SUPERSEDED by expert-streaming
 - **Change 11** (n_batch tuning) — DONE (n_batch=1 cap removed in earlier session, Mixtral prompt eval 4.5s → 1.2s)
 
+## Sparse MoE Mmap Mode: IMPLEMENTING (2026-03-22)
+
+### Change 18: OS page cache for ultra-sparse MoE models
+
+**Problem:** Expert-streaming adds overhead (eval callback, pool slots, tensor pointer
+rewriting) on every layer. For ultra-sparse MoE models (e.g. Qwen3-Coder-Next, 512
+experts, 10 active = 2%), the active working set (~900 MB) fits easily in RAM. The OS
+mmap page cache handles sparsity natively — only active expert pages get loaded.
+CPU-only llama.cpp (ngl=0) achieved 3.4 tok/s on this model vs Hypura's 1.2 tok/s
+because the pool overhead dominated.
+
+**Fix:** Detect ultra-sparse MoE models at placement time. When `activation_ratio < 15%`
+AND `active_bytes < 30% of unified memory` AND the full model fits in GPU working set,
+use `SparseMoeMmap` mode: all tensors on GPU via `use_mmap=true`, no custom buffer, no
+eval callback. Falls through to `generate_blocking` — identical to the "fits in memory"
+path.
+
+**Decision threshold:**
+- Mixtral (2/8 = 25%): too dense → expert-streaming (pool + callback)
+- Qwen3-Coder-Next (10/512 = 2%): sparse → mmap (OS page cache)
+
+#### Status: READY FOR TESTING
+
+Test: `cargo run --release -- bench --max-tokens 30 --context 512 ./test-models/Qwen3-Coder-Next-Q4_K_M.gguf`
+
+Expected: ~3-4 tok/s (matching llama.cpp CPU-only, but with GPU acceleration via Metal
+mmap shared buffers).
+
+**If crash:** The model is 45.2 GB. Metal `recommendedMaxWorkingSetSize` on M1 Max 32GB
+is ~26.8 GB. If Metal OOMs on the full mmap, the `total_bytes <= caps.gpu_bytes` check
+in `try_sparse_moe_mmap` should have prevented this mode. Check `caps.gpu_bytes`.
+
 **Pending benchmarks (2026-03-21):**
 
 1. **Qwen3-Coder-Next 80B-A3B Q4_K_M** (~45.2 GB) — MoE with 512 experts, 10 active

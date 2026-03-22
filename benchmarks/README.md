@@ -235,3 +235,9 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 - This correctly enables keep-resident for Mixtral (26.3 GB < 28 GB) while
   forcing streaming for Llama 70B (33 + 9.8 GB >> 28 GB).
 | 2026-03-22 | Phi-3.5-MoE-instruct-Q4_K_M Q4K | Apple M1 Max 32GB | 23.6 GB | 0.0 GB | 0.0 GB | — | 2.2 | — |
+| 2026-03-22 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | 0.2 | 1.9 | 8.6x |
+| 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 1.6 GB | 0.0 GB | 43.6 GB | 3.4 | 1.2 | 0.4x |
+| 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 1.6 GB | 0.0 GB | 43.6 GB | — | 1.1 | — |
+| 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 45.2 GB | 0.0 GB | 0.0 GB | — | 3.2 | — |
+| 2026-03-22 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.8 | — |
+| 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 45.2 GB | 0.0 GB | 0.0 GB | 2.6 | 2.9 | 1.1x |
