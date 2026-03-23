@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
-use std::os::unix::io::AsRawFd;
+use crate::io::compat::{self, NativeFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -74,8 +74,8 @@ pub struct IoPool {
     tx: Option<std::sync::mpsc::Sender<IoPoolTask>>,
     /// Worker thread handles.
     handles: Vec<std::thread::JoinHandle<()>>,
-    /// Per-worker file descriptors (for cleanup).
-    worker_fds: Vec<i32>,
+    /// Per-worker file descriptors / handles (for cleanup).
+    worker_fds: Vec<NativeFd>,
     /// Throughput tracking: total bytes loaded by all workers.
     pub bytes_loaded: Arc<AtomicU64>,
     /// Throughput tracking: total load time in nanoseconds.
@@ -98,12 +98,7 @@ impl IoPool {
         let mut handles = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
-            let file = std::fs::File::open(model_path)?;
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::fcntl(fd, libc::F_NOCACHE, 1);
-            }
-            std::mem::forget(file);
+            let fd = compat::open_direct_fd(model_path)?;
             worker_fds.push(fd);
 
             let rx = rx.clone();
@@ -155,18 +150,16 @@ impl Drop for IoPool {
             let _ = handle.join();
         }
 
-        // Close per-worker fds
+        // Close per-worker fds / handles
         for fd in &self.worker_fds {
-            unsafe {
-                libc::close(*fd);
-            }
+            compat::close_fd(*fd);
         }
     }
 }
 
-/// I/O worker thread: pulls tasks from shared channel, executes pread.
+/// I/O worker thread: pulls tasks from shared channel, executes pread / ReadFile.
 fn io_worker(
-    fd: i32,
+    fd: NativeFd,
     rx: Arc<Mutex<std::sync::mpsc::Receiver<IoPoolTask>>>,
     state: Arc<PrefetchState>,
     bytes_loaded: Arc<AtomicU64>,
@@ -213,18 +206,13 @@ fn io_worker(
     }
 }
 
-/// Perform pread I/O for a single region. Standalone function used by IoPool workers.
-fn pread_region(fd: i32, base: *mut u8, offset: usize, size: usize, file_offset: u64) {
+/// Perform positional I/O for a single region (pread on Unix, ReadFile on Windows).
+fn pread_region(fd: NativeFd, base: *mut u8, offset: usize, size: usize, file_offset: u64) {
     let dst = unsafe { base.add(offset) };
     let mut read = 0usize;
     while read < size {
-        let n = unsafe {
-            libc::pread(
-                fd,
-                dst.add(read) as *mut c_void,
-                size - read,
-                (file_offset + read as u64) as libc::off_t,
-            )
+        let n = {
+            compat::read_at_fd(fd, unsafe { dst.add(read) }, size - read, file_offset + read as u64)
         };
         if n <= 0 {
             break;
@@ -611,9 +599,7 @@ impl PrefetchState {
 
         for &(offset, size, _) in regions {
             let ptr = unsafe { base.add(offset) };
-            unsafe {
-                libc::madvise(ptr as *mut c_void, size, libc::MADV_FREE);
-            }
+            compat::advise_free_pages(ptr, size);
         }
 
         // Invalidate neuron cache entries for this layer
@@ -1006,13 +992,7 @@ impl PrefetchState {
                                     {
                                         let offset = ev_layout.expert_buffer_offset(ev_e);
                                         let ptr = unsafe { base.add(offset) };
-                                        unsafe {
-                                            libc::madvise(
-                                                ptr as *mut c_void,
-                                                ev_layout.expert_stride,
-                                                libc::MADV_FREE,
-                                            );
-                                        }
+                                        compat::advise_free_pages(ptr, ev_layout.expert_stride);
                                     }
                                 }
                             }
@@ -1255,25 +1235,15 @@ impl PrefetchState {
             return None;
         }
 
-        // Allocate resident buffer
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
+        // Allocate resident buffer (anonymous pages, lazily committed)
+        let base = compat::alloc_pages(total_size);
+        if base.is_null() {
             tracing::warn!(
                 "Failed to allocate resident FFN buffer ({:.1} GB)",
                 total_size as f64 / 1e9,
             );
             return None;
         }
-        let base = base as *mut u8;
 
         tracing::info!(
             "Resident FFN buffer: {:.1} GB for {} layers (layers 0-{})",
@@ -1644,12 +1614,7 @@ impl Drop for PrefetchState {
         }
         // Release resident FFN buffer
         if !self.resident_ffn_base.is_null() && self.resident_ffn_size > 0 {
-            unsafe {
-                libc::munmap(
-                    self.resident_ffn_base as *mut libc::c_void,
-                    self.resident_ffn_size,
-                );
-            }
+            compat::free_pages(self.resident_ffn_base, self.resident_ffn_size);
         }
     }
 }
@@ -1717,14 +1682,11 @@ impl ExpertPool {
     pub fn release_layer(&mut self, layer_idx: u32) {
         if let Some(slots) = self.layer_slots.remove(&layer_idx) {
             for slot in slots {
-                // MADV_FREE the slot's pages
-                unsafe {
-                    libc::madvise(
-                        self.pool_base.add(slot * self.slot_size) as *mut c_void,
-                        self.slot_size,
-                        libc::MADV_FREE,
-                    );
-                }
+                // Release the slot's physical pages back to the OS
+                compat::advise_free_pages(
+                    unsafe { self.pool_base.add(slot * self.slot_size) },
+                    self.slot_size,
+                );
                 self.free_slots.push(slot);
             }
         }
@@ -1820,22 +1782,13 @@ impl HypuraBuftController {
         }
 
         let aligned = (max_ffn_size + 4095) & !4095;
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                aligned,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
+        let ptr = compat::alloc_pages(aligned);
+        if ptr.is_null() {
             tracing::warn!("Failed to allocate FFN loading scratch ({aligned} bytes)");
             return;
         }
 
-        *self.loading_scratch.lock().unwrap() = ptr as *mut u8;
+        *self.loading_scratch.lock().unwrap() = ptr;
         self.loading_scratch_size
             .store(aligned, Ordering::Relaxed);
         tracing::info!(
@@ -1858,7 +1811,7 @@ impl HypuraBuftController {
         let mut scratch = self.loading_scratch.lock().unwrap();
         let size = self.loading_scratch_size.swap(0, Ordering::Relaxed);
         if !scratch.is_null() && size > 0 {
-            unsafe { libc::munmap(*scratch as *mut libc::c_void, size) };
+            compat::free_pages(*scratch, size);
             *scratch = std::ptr::null_mut();
         }
     }

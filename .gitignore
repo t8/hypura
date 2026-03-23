@@ -19,3 +19,23 @@
 .idea/
 .vscode/
 *.code-workspace
+
+# Local cargo config (machine-specific: LIBCLANG_PATH etc.)
+.cargo/config.toml
+
+# Claude Code local settings
+.claude/
+
+# Local temporary build artifacts
+yes/
+target-codex/
+target-codex*/
+debug-*.log
+_docs/logs/
+dist/
+*.tar.gz
+*.zip
+
+# Local assistant/session metadata
+.specstory/
+.cargo/
