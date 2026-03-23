@@ -121,40 +121,58 @@ fn main() {
     println!("cargo:rerun-if-changed=src/hypura_buft.h");
 
     // ── Generate Rust bindings via bindgen ───────────────────────────────────
-    let include_llama = llama_dir.join("include");
-    let include_ggml = llama_dir.join("ggml/include");
-
-    let bindings = bindgen::Builder::default()
-        .header(
-            PathBuf::from(&manifest_dir)
-                .join("wrapper.h")
-                .to_str()
-                .unwrap()
-                .to_string(),
-        )
-        .clang_arg(format!("-I{}", include_llama.display()))
-        .clang_arg(format!("-I{}", include_ggml.display()))
-        .clang_arg(format!("-I{}", src_dir.display()))
-        .allowlist_function("llama_.*")
-        .allowlist_function("ggml_.*")
-        .allowlist_function("gguf_.*")
-        .allowlist_function("hypura_.*")
-        .allowlist_type("llama_.*")
-        .allowlist_type("ggml_.*")
-        .allowlist_type("gguf_.*")
-        .allowlist_type("hypura_.*")
-        .allowlist_var("LLAMA_.*")
-        .allowlist_var("GGML_.*")
-        .allowlist_var("GGUF_.*")
-        .derive_debug(true)
-        .derive_default(true)
-        .generate()
-        .expect("Failed to generate bindings");
-
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Failed to write bindings");
+
+    // Pre-generated bindings fallback: avoids needing libclang on every machine.
+    // Priority: HYPURA_PREGENERATED_BINDINGS env var > hypura-sys/bindings.rs in source tree.
+    let pregenerated = env::var("HYPURA_PREGENERATED_BINDINGS")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            let p = PathBuf::from(&manifest_dir).join("bindings.rs");
+            if p.exists() { Some(p) } else { None }
+        });
+
+    if let Some(src) = pregenerated {
+        std::fs::copy(&src, out_path.join("bindings.rs"))
+            .expect("Failed to copy pre-generated bindings");
+        println!("cargo:warning=Using pre-generated bindings from {}", src.display());
+    } else {
+        let include_llama = llama_dir.join("include");
+        let include_ggml = llama_dir.join("ggml/include");
+
+        let bindings = bindgen::Builder::default()
+            .header(
+                PathBuf::from(&manifest_dir)
+                    .join("wrapper.h")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            )
+            .clang_arg(format!("-I{}", include_llama.display()))
+            .clang_arg(format!("-I{}", include_ggml.display()))
+            .clang_arg(format!("-I{}", src_dir.display()))
+            .allowlist_function("llama_.*")
+            .allowlist_function("ggml_.*")
+            .allowlist_function("gguf_.*")
+            .allowlist_function("hypura_.*")
+            .allowlist_type("llama_.*")
+            .allowlist_type("ggml_.*")
+            .allowlist_type("gguf_.*")
+            .allowlist_type("hypura_.*")
+            .allowlist_var("LLAMA_.*")
+            .allowlist_var("GGML_.*")
+            .allowlist_var("GGUF_.*")
+            .derive_debug(true)
+            .derive_default(true)
+            .generate()
+            .expect("Failed to generate bindings — install LLVM and set LIBCLANG_PATH, \
+                     or provide HYPURA_PREGENERATED_BINDINGS=/path/to/bindings.rs");
+
+        bindings
+            .write_to_file(out_path.join("bindings.rs"))
+            .expect("Failed to write bindings");
+    }
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!(

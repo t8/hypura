@@ -19,3 +19,9 @@
 .idea/
 .vscode/
 *.code-workspace
+
+# Local cargo config (machine-specific: LIBCLANG_PATH etc.)
+.cargo/config.toml
+
+# Claude Code local settings
+.claude/
