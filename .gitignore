@@ -29,3 +29,10 @@
 # Local temporary build artifacts
 yes/
 target-codex/
+target-codex*/
+debug-*.log
+_docs/logs/
+
+# Local assistant/session metadata
+.specstory/
+.cargo/

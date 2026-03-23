@@ -5,30 +5,79 @@
 |  _  | |_| | |_) | |_| | | | (_| |
 |_| |_|\__, | .__/ \__,_|_|  \__,_|
        |___/|_|
-   メモリに収まらないモデルを動かす / Run models too big for your memory
+  Run models too big for your memory
 ```
 
 ---
 
-## 概要
+## RTX 30 Stable Release (Windows)
 
-Hypura はストレージ階層を意識した LLM 推論スケジューラです。
-モデルのテンソルを GPU・RAM・NVMe にアクセスパターン・帯域幅・ハードウェア特性に基づいて自動配置し、**物理メモリを超える大規模モデルをクラッシュなしに動作させます**。
+### 日本語
 
-- 31 GB の Mixtral 8x7B を 32 GB マシンで **2.2 tok/s** で実行
-- 40 GB の Llama 3.3 70B を 32 GB マシンで **0.3 tok/s** で実行
-- vanilla llama.cpp は両方 OOM でクラッシュ
+このブランチは **RTX 30 系 (sm_86) 向け安定版** の手順を優先して記載しています。  
+`hypura.exe` は GGUF を対象に、Ollama 互換 API (`/`, `/api/tags`, `/api/generate`, `/api/chat`) で推論提供できます。
 
-**対応プラットフォーム:**
+**推奨環境 (Windows 11):**
+- NVIDIA RTX 30 series (3060/3070/3080/3090)
+- CUDA Toolkit 12.x
+- Visual Studio 2022 Build Tools
+- Rust stable
 
-| プラットフォーム | GPU | NVMe I/O |
-|---|---|---|
-| macOS (Apple Silicon) | Metal (`F_NOCACHE` + `pread`) | ✅ |
-| Windows ネイティブ | CUDA RTX 2060+ (`FILE_FLAG_NO_BUFFERING` + `ReadFile`) | ✅ |
-| WSL2 (Windows) | CUDA RTX 2060+ (`posix_fadvise` + `pread`) | ✅ |
-| Linux | CUDA RTX 2060+ (`posix_fadvise` + `pread`) | ✅ |
+**最短導入:**
+```powershell
+git clone --recurse-submodules https://github.com/zapabob/hypura.git
+cd hypura
+cargo build --release
+```
+
+**最短実行:**
+```powershell
+.\target\release\hypura.exe serve "F:\path\to\model.gguf" --port 8080 --context 1024
+```
+
+**動作確認 (smoke):**
+```powershell
+Invoke-WebRequest http://127.0.0.1:8080/
+Invoke-WebRequest http://127.0.0.1:8080/api/tags
+Invoke-WebRequest -Uri http://127.0.0.1:8080/api/generate -Method POST -ContentType "application/json" -Body '{"model":"<model-name>","prompt":"hello","stream":false}'
+```
+
+### English
+
+This branch includes a **stable path for RTX 30 GPUs (sm_86)** on Windows.  
+`hypura.exe` serves GGUF models through an Ollama-compatible API (`/`, `/api/tags`, `/api/generate`, `/api/chat`).
+
+**Recommended environment (Windows 11):**
+- NVIDIA RTX 30 series (3060/3070/3080/3090)
+- CUDA Toolkit 12.x
+- Visual Studio 2022 Build Tools
+- Rust stable toolchain
+
+**Quick install:**
+```powershell
+git clone --recurse-submodules https://github.com/zapabob/hypura.git
+cd hypura
+cargo build --release
+```
+
+**Quick run:**
+```powershell
+.\target\release\hypura.exe serve "F:\path\to\model.gguf" --port 8080 --context 1024
+```
+
+**Smoke checks:**
+```powershell
+Invoke-WebRequest http://127.0.0.1:8080/
+Invoke-WebRequest http://127.0.0.1:8080/api/tags
+Invoke-WebRequest -Uri http://127.0.0.1:8080/api/generate -Method POST -ContentType "application/json" -Body '{"model":"<model-name>","prompt":"hello","stream":false}'
+```
 
 ---
+
+## 概要 / Overview
+
+Hypura is a storage-tier-aware LLM inference scheduler.  
+モデルテンソルを GPU・RAM・NVMe に分散し、物理メモリ超過サイズのモデルを実行可能にします。
 
 ## なぜ必要か
 
