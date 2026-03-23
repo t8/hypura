@@ -20,6 +20,7 @@ fn main() {
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
+        .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("GGML_CPU", "ON")
         .define("GGML_BLAS", "OFF");

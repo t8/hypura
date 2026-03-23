@@ -25,3 +25,7 @@
 
 # Claude Code local settings
 .claude/
+
+# Local temporary build artifacts
+yes/
+target-codex/
