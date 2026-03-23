@@ -73,7 +73,7 @@ fn get_core_counts() -> (u32, u32) {
 fn get_core_counts() -> (u32, u32) {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_all();
-    let physical = sys.physical_cpu_count().unwrap_or(
+    let physical = sys.physical_core_count().unwrap_or(
         std::thread::available_parallelism()
             .map(|n| n.get() / 2)
             .unwrap_or(2),

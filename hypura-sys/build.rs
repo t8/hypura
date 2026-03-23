@@ -1,7 +1,24 @@
 use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
+    // #region agent log
+    debug_log(
+        "h1",
+        "build_main_entry",
+        serde_json::json!({
+            "manifest_dir": env::var("CARGO_MANIFEST_DIR").unwrap_or_default(),
+            "profile": env::var("PROFILE").unwrap_or_default(),
+            "target_os": env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+            "target_env": env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default(),
+            "opt_level": env::var("OPT_LEVEL").unwrap_or_default(),
+            "cmake_generator": env::var("CMAKE_GENERATOR").unwrap_or_default(),
+        }),
+    );
+    // #endregion
+
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let llama_dir = PathBuf::from(&manifest_dir).join("../vendor/llama.cpp");
     // dunce::canonicalize strips the \\?\ UNC prefix that std::fs::canonicalize
@@ -16,14 +33,32 @@ fn main() {
 
     // ── Build llama.cpp via cmake ────────────────────────────────────────────
     let mut cmake_config = cmake::Config::new(&llama_dir);
+    cmake_config.profile("Release");
     cmake_config
         .define("BUILD_SHARED_LIBS", "OFF")
+        .define("CMAKE_BUILD_TYPE", "Release")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("GGML_CPU", "ON")
         .define("GGML_BLAS", "OFF");
+    if target_os == "windows" {
+        // Force non-Debug CRT to avoid __imp__CrtDbgReport unresolved symbols.
+        cmake_config.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL");
+    }
+    // #region agent log
+    debug_log(
+        "h2",
+        "cmake_base_defines",
+        serde_json::json!({
+            "CMAKE_BUILD_TYPE": "Release",
+            "CMAKE_MSVC_RUNTIME_LIBRARY": if target_os == "windows" { "MultiThreadedDLL" } else { "n/a" },
+            "LLAMA_BUILD_TOOLS": "OFF",
+            "GGML_CPU": "ON",
+        }),
+    );
+    // #endregion
 
     if use_metal {
         // macOS / Apple Silicon — Metal GPU
@@ -52,6 +87,17 @@ fn main() {
         if let Some(cuda_root) = get_cuda_root() {
             cmake_config.define("CUDAToolkit_ROOT", cuda_root.display().to_string());
         }
+        // #region agent log
+        debug_log(
+            "h3",
+            "cuda_path_resolution",
+            serde_json::json!({
+                "cuda_root": get_cuda_root().map(|p| p.display().to_string()),
+                "nvcc": find_nvcc().map(|p| p.display().to_string()),
+                "arches": env::var("HYPURA_CUDA_ARCHITECTURES").ok(),
+            }),
+        );
+        // #endregion
     } else {
         // CPU-only fallback
         cmake_config
@@ -60,8 +106,56 @@ fn main() {
             .define("GGML_OPENMP", "ON");
     }
 
+    // #region agent log
+    debug_log(
+        "h2",
+        "cmake_profile_selected",
+        serde_json::json!({
+            "profile_api": "Release",
+            "note": "CMAKE_BUILD_TYPE is ignored by multi-config generators on Windows, profile() drives --config",
+            "cargo_profile_env": env::var("PROFILE").unwrap_or_default(),
+            "cargo_encoded_rustflags": env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default(),
+        }),
+    );
+    // #endregion
+
     let dst = cmake_config.build();
     let lib_dir = dst.join("lib");
+    // #region agent log
+    debug_log(
+        "h4",
+        "cmake_build_output",
+        serde_json::json!({
+            "dst": dst.display().to_string(),
+            "lib_dir_exists": lib_dir.exists(),
+        }),
+    );
+    // #endregion
+    // #region agent log
+    let cache_path = dst.join("build").join("CMakeCache.txt");
+    let cache_snippet = std::fs::read_to_string(&cache_path)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter(|l| {
+                    l.starts_with("CMAKE_BUILD_TYPE:")
+                        || l.starts_with("CMAKE_CONFIGURATION_TYPES:")
+                        || l.starts_with("CMAKE_MSVC_RUNTIME_LIBRARY:")
+                })
+                .map(|l| l.to_string())
+                .take(8)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    debug_log(
+        "h6",
+        "cmake_cache_runtime_settings",
+        serde_json::json!({
+            "cache_path": cache_path.display().to_string(),
+            "cache_lines": cache_snippet,
+        }),
+    );
+    // #endregion
 
     // ── Link the static libraries ────────────────────────────────────────────
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -85,6 +179,16 @@ fn main() {
         println!("cargo:rustc-link-lib=cuda");
         println!("cargo:rustc-link-lib=cublas");
         println!("cargo:rustc-link-lib=cudart");
+        // #region agent log
+        debug_log(
+            "h5",
+            "rust_link_cuda_libs",
+            serde_json::json!({
+                "link_libs": ["llama","ggml","ggml-base","ggml-cpu","ggml-cuda","cuda","cublas","cudart"],
+                "cuda_lib_path": get_cuda_lib_path().map(|p| p.display().to_string()),
+            }),
+        );
+        // #endregion
         if target_os == "linux" {
             println!("cargo:rustc-link-lib=stdc++");
         }
@@ -164,6 +268,8 @@ fn main() {
             .allowlist_var("LLAMA_.*")
             .allowlist_var("GGML_.*")
             .allowlist_var("GGUF_.*")
+            // MSVC/C bind differences can make bindgen layout asserts flaky on Windows.
+            .layout_tests(false)
             .derive_debug(true)
             .derive_default(true)
             .generate()
@@ -188,6 +294,32 @@ fn main() {
         "cargo:rerun-if-changed={}",
         llama_dir.join("ggml").display()
     );
+}
+
+fn debug_log(hypothesis_id: &str, message: &str, data: serde_json::Value) {
+    let log_path = env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .and_then(|p| PathBuf::from(p).parent().map(|pp| pp.join("debug-4ee339.log")))
+        .unwrap_or_else(|| PathBuf::from("debug-4ee339.log"));
+    let payload = serde_json::json!({
+        "sessionId": "4ee339",
+        "runId": env::var("HYPURA_DEBUG_RUN_ID").unwrap_or_else(|_| "pre-fix".to_string()),
+        "hypothesisId": hypothesis_id,
+        "location": "hypura-sys/build.rs",
+        "message": message,
+        "data": data,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    });
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(f, "{}", payload);
+    }
 }
 
 // ── CUDA detection helpers ────────────────────────────────────────────────────

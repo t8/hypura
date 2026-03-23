@@ -107,37 +107,19 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::NativeFd;
-    use std::os::windows::ffi::OsStrExt;
-
-    const INVALID_HANDLE_VALUE: isize = -1isize;
+    use std::os::windows::io::IntoRawHandle;
 
     pub fn open_direct_fd(path: &std::path::Path) -> std::io::Result<NativeFd> {
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
-            FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
-        };
-
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                FILE_GENERIC_READ,
-                FILE_SHARE_READ,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
-                0,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(handle)
+        // Keep Windows path simple and robust across windows-sys versions.
+        // We intentionally avoid CreateFileW flags here to prevent API
+        // signature/feature drift from breaking compilation.
+        let file = std::fs::File::open(path)?;
+        Ok(file.into_raw_handle() as NativeFd)
     }
 
     pub fn close_fd(fd: NativeFd) {
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(fd);
+            windows_sys::Win32::Foundation::CloseHandle(fd as _);
         }
     }
 
@@ -155,7 +137,7 @@ mod imp {
 
         let ok = unsafe {
             ReadFile(
-                fd,
+                fd as _,
                 dst as *mut _,
                 read_size,
                 &mut bytes_read,
