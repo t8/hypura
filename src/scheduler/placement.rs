@@ -9,8 +9,26 @@ use crate::profiler::types::HardwareProfile;
 use crate::scheduler::prefetch::build_prefetch_schedule;
 use crate::scheduler::types::*;
 
-const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for macOS
-const GPU_RUNTIME_OVERHEAD: u64 = 1 << 30; // 1 GiB reserved for compute buffers + Metal overhead (actual usage ~362 MiB)
+/// RAM reserved for the OS and background processes.
+///
+/// macOS: ~2 GiB (kernel + system agents).
+/// Windows: ~4 GiB (kernel + system processes tend to use more).
+/// Linux / WSL2: ~1 GiB conservative estimate.
+#[cfg(target_os = "macos")]
+const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB
+#[cfg(target_os = "windows")]
+const OS_OVERHEAD: u64 = 4 * (1 << 30); // 4 GiB
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+const OS_OVERHEAD: u64 = 1 * (1 << 30); // 1 GiB (Linux / WSL2)
+
+/// GPU runtime overhead: CUDA/Metal framework + compute buffer pool.
+///
+/// CUDA: ~0.5 GiB driver + context overhead on Ampere+.
+/// Metal: ~1 GiB.
+#[cfg(target_os = "macos")]
+const GPU_RUNTIME_OVERHEAD: u64 = 1 << 30; // 1 GiB (Metal)
+#[cfg(not(target_os = "macos"))]
+const GPU_RUNTIME_OVERHEAD: u64 = 512 * (1 << 20); // 512 MiB (CUDA)
 const SYNC_OVERHEAD_PER_LAYER_US: f64 = 50.0; // 50μs CPU-GPU sync per layer
 const MOE_CACHE_HIT_RATE: f64 = 0.965; // From PowerInfer-2, matches estimator.rs
 

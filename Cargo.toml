@@ -52,5 +52,13 @@ memmap2 = "0.9"
 linked-hash-map = "0.5"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+] }
+
 [dev-dependencies]
 tempfile = "3"

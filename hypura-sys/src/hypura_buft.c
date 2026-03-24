@@ -2,9 +2,36 @@
 #include "ggml-backend-impl.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 
-/* ---------- Context structs ---------- */
+/* ── Platform-specific anonymous memory ──────────────────────────────────── */
+
+#ifdef _WIN32
+#  include <windows.h>
+
+static void *platform_alloc_pages(size_t size) {
+    return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+static void platform_free_pages(void *addr, size_t size) {
+    (void)size;
+    if (addr) VirtualFree(addr, 0, MEM_RELEASE);
+}
+
+#else
+#  include <sys/mman.h>
+
+static void *platform_alloc_pages(size_t size) {
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_ANON | MAP_PRIVATE, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+
+static void platform_free_pages(void *addr, size_t size) {
+    if (addr) munmap(addr, size);
+}
+#endif
+
+/* ── Context structs ─────────────────────────────────────────────────────── */
 
 typedef struct {
     hypura_on_tensor_loaded_t on_tensor_loaded;
@@ -14,7 +41,7 @@ typedef struct {
 } hypura_buft_context;
 
 typedef struct {
-    void  *base;       /* original mmap'd buffer (loading phase) */
+    void  *base;       /* anonymous page buffer (loading phase) */
     size_t size;
     hypura_buft_context *buft_ctx;
     void  *pool_base;  /* pool buffer (inference phase, expert-streaming) */
@@ -22,16 +49,16 @@ typedef struct {
     int    pool_active; /* 0 = loading phase, 1 = pool phase */
 } hypura_buffer_context;
 
-/* ---------- Buffer vtable ---------- */
+/* ── Buffer vtable ───────────────────────────────────────────────────────── */
 
 static void hypura_buf_free(ggml_backend_buffer_t buffer) {
     hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
     if (ctx) {
         if (ctx->base && ctx->size > 0) {
-            munmap(ctx->base, ctx->size);
+            platform_free_pages(ctx->base, ctx->size);
         }
         if (ctx->pool_base && ctx->pool_size > 0) {
-            munmap(ctx->pool_base, ctx->pool_size);
+            platform_free_pages(ctx->pool_base, ctx->pool_size);
         }
         free(ctx);
     }
@@ -95,7 +122,7 @@ static void hypura_buf_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     (void)buffer; (void)value;
 }
 
-/* ---------- Buffer type vtable ---------- */
+/* ── Buffer type vtable ──────────────────────────────────────────────────── */
 
 static const char *hypura_buft_get_name(ggml_backend_buffer_type_t buft) {
     (void)buft;
@@ -104,22 +131,19 @@ static const char *hypura_buft_get_name(ggml_backend_buffer_type_t buft) {
 
 static ggml_backend_buffer_t hypura_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     /* Page-align the allocation for direct I/O compatibility.
-     * Use mmap instead of posix_memalign: on macOS unified memory, mmap pages
-     * are lazily committed on first access. This avoids Metal OOM from a large
-     * virtual reservation — uncommitted mmap pages don't count against Metal's
-     * working set the same way heap allocations do. Pages loaded via pread get
-     * committed; released pages (MADV_FREE) return to uncommitted state. */
+     * Use platform_alloc_pages (mmap/VirtualAlloc): pages are lazily committed
+     * on first access, so a large virtual reservation doesn't immediately
+     * consume physical memory or GPU working set. */
     size_t aligned_size = (size + 4095) & ~(size_t)4095;
 
-    void *base = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
-                       MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (base == MAP_FAILED) {
+    void *base = platform_alloc_pages(aligned_size);
+    if (!base) {
         return NULL;
     }
 
     hypura_buffer_context *buf_ctx = (hypura_buffer_context *)calloc(1, sizeof(hypura_buffer_context));
     if (!buf_ctx) {
-        free(base);
+        platform_free_pages(base, aligned_size);
         return NULL;
     }
     buf_ctx->base     = base;
@@ -127,15 +151,15 @@ static ggml_backend_buffer_t hypura_buft_alloc_buffer(ggml_backend_buffer_type_t
     buf_ctx->buft_ctx = (hypura_buft_context *)buft->context;
 
     struct ggml_backend_buffer_i iface = {
-        .free_buffer  = hypura_buf_free,
-        .get_base     = hypura_buf_get_base,
-        .init_tensor  = hypura_buf_init_tensor,
+        .free_buffer   = hypura_buf_free,
+        .get_base      = hypura_buf_get_base,
+        .init_tensor   = hypura_buf_init_tensor,
         .memset_tensor = hypura_buf_memset_tensor,
-        .set_tensor   = hypura_buf_set_tensor,
-        .get_tensor   = hypura_buf_get_tensor,
-        .cpy_tensor   = hypura_buf_cpy_tensor,
-        .clear        = hypura_buf_clear,
-        .reset        = NULL,
+        .set_tensor    = hypura_buf_set_tensor,
+        .get_tensor    = hypura_buf_get_tensor,
+        .cpy_tensor    = hypura_buf_cpy_tensor,
+        .clear         = hypura_buf_clear,
+        .reset         = NULL,
     };
 
     ggml_backend_buffer_t buf = ggml_backend_buffer_init(buft, iface, buf_ctx, aligned_size);
@@ -162,7 +186,7 @@ static bool hypura_buft_is_host(ggml_backend_buffer_type_t buft) {
     return true; /* critical: CPU backend requires is_host=true */
 }
 
-/* ---------- Public API ---------- */
+/* ── Public API ──────────────────────────────────────────────────────────── */
 
 ggml_backend_buffer_type_t hypura_buft_create(
     hypura_on_tensor_loaded_t on_tensor_loaded,
@@ -207,7 +231,7 @@ void *hypura_buffer_get_base_ptr(ggml_backend_buffer_t buffer) {
     return ctx ? ctx->base : NULL;
 }
 
-/* --- Pool buffer API --- */
+/* ── Pool buffer API ─────────────────────────────────────────────────────── */
 
 int hypura_buffer_init_pool(ggml_backend_buffer_t buffer, size_t pool_size) {
     if (!buffer) return -1;
@@ -215,9 +239,8 @@ int hypura_buffer_init_pool(ggml_backend_buffer_t buffer, size_t pool_size) {
     if (!ctx) return -1;
 
     size_t aligned = (pool_size + 4095) & ~(size_t)4095;
-    void *pool = mmap(NULL, aligned, PROT_READ | PROT_WRITE,
-                      MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (pool == MAP_FAILED) return -1;
+    void *pool = platform_alloc_pages(aligned);
+    if (!pool) return -1;
 
     ctx->pool_base = pool;
     ctx->pool_size = aligned;
@@ -230,7 +253,7 @@ void hypura_buffer_release_loading_buffer(ggml_backend_buffer_t buffer) {
     if (!ctx) return;
 
     if (ctx->base && ctx->size > 0) {
-        munmap(ctx->base, ctx->size);
+        platform_free_pages(ctx->base, ctx->size);
         ctx->base = NULL;
         ctx->size = 0;
     }

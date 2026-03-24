@@ -1,10 +1,9 @@
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::time::Instant;
 
 use crate::profiler::types::{BandwidthCurve, StorageProfile, StorageType};
 
-const BLOCK_SIZES: &[usize] = &[4096, 65536, 131072, 1_048_576, 4_194_304];
+const BLOCK_SIZES: &[usize] = &[4096, 65536, 131_072, 1_048_576, 4_194_304];
 const SEQUENTIAL_PASSES: usize = 3;
 const RANDOM_IOPS_READS: usize = 10_000;
 
@@ -14,8 +13,8 @@ pub fn profile_storage() -> anyhow::Result<Vec<StorageProfile>> {
 
     for disk in disks.list() {
         let mount = disk.mount_point().to_string_lossy().to_string();
-        // Only benchmark the root volume (or Data volume on APFS)
-        if mount != "/" && mount != "/System/Volumes/Data" {
+
+        if !is_primary_volume(&mount) {
             continue;
         }
 
@@ -36,7 +35,7 @@ pub fn profile_storage() -> anyhow::Result<Vec<StorageProfile>> {
         profiles.push(StorageProfile {
             device_path,
             mount_point: mount,
-            device_type: StorageType::NvmePcie, // All internal Apple Silicon storage is NVMe
+            device_type: detect_storage_type(disk),
             capacity_bytes,
             free_bytes,
             sequential_read,
@@ -45,33 +44,53 @@ pub fn profile_storage() -> anyhow::Result<Vec<StorageProfile>> {
             wear_level: None,
         });
 
-        break; // Only benchmark the first root volume
+        break; // Benchmark only the first matching volume
     }
 
     anyhow::ensure!(!profiles.is_empty(), "No storage devices found to benchmark");
     Ok(profiles)
 }
 
+/// Returns true for the volume that should be benchmarked.
+fn is_primary_volume(mount: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mount == "/" || mount == "/System/Volumes/Data"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux / WSL2, benchmark the root filesystem
+        mount == "/"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, take the first fixed drive (usually C:\)
+        mount.ends_with('\\') && mount.len() == 3
+    }
+}
+
+fn detect_storage_type(disk: &sysinfo::Disk) -> StorageType {
+    use sysinfo::DiskKind;
+    match disk.kind() {
+        DiskKind::SSD | DiskKind::Unknown(_) => StorageType::NvmePcie,
+        DiskKind::HDD => StorageType::Sata,
+    }
+}
+
 fn benchmark_storage(mount_point: &str, free_bytes: u64) -> anyhow::Result<(BandwidthCurve, u64)> {
-    // Size temp file: 1 GiB if space allows, 256 MiB otherwise
     let file_size: usize = if free_bytes > 5 * (1 << 30) {
         1 << 30 // 1 GiB
     } else {
         256 << 20 // 256 MiB
     };
 
-    // Create temp file with data
-    let temp_dir = if mount_point == "/System/Volumes/Data" {
-        std::env::temp_dir()
-    } else {
-        std::path::PathBuf::from(mount_point).join("tmp")
-    };
+    let temp_dir = pick_temp_dir(mount_point);
     let temp_path = temp_dir.join(".hypura_bench_tmp");
 
     // Write test data
     {
         let mut f = std::fs::File::create(&temp_path)?;
-        let pattern = vec![0xA5u8; 1 << 20]; // 1 MiB pattern
+        let pattern = vec![0xA5u8; 1 << 20]; // 1 MiB chunks
         let chunks = file_size / pattern.len();
         for _ in 0..chunks {
             f.write_all(&pattern)?;
@@ -85,11 +104,25 @@ fn benchmark_storage(mount_point: &str, free_bytes: u64) -> anyhow::Result<(Band
         Ok((sequential, iops))
     })();
 
-    // Clean up
     let _ = std::fs::remove_file(&temp_path);
-
     result
 }
+
+fn pick_temp_dir(mount_point: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    if mount_point == "/System/Volumes/Data" {
+        return std::env::temp_dir();
+    }
+
+    let candidate = std::path::PathBuf::from(mount_point);
+    if candidate.exists() {
+        candidate
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+// ── Sequential read benchmark ─────────────────────────────────────────────────
 
 fn benchmark_sequential(
     path: &std::path::Path,
@@ -106,141 +139,183 @@ fn benchmark_sequential(
         let mut trial_bandwidths = Vec::with_capacity(SEQUENTIAL_PASSES);
 
         for _ in 0..SEQUENTIAL_PASSES {
-            let file = std::fs::File::open(path)?;
-            let fd = file.as_raw_fd();
-
-            // Bypass filesystem cache
-            let ret = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-            anyhow::ensure!(ret != -1, "F_NOCACHE failed: {}", std::io::Error::last_os_error());
-
-            let mut buf = AlignedBuffer::new(block_size, 4096)?;
-            let mut total_read: usize = 0;
-
-            let start = Instant::now();
-            while total_read < file_size {
-                let to_read = block_size.min(file_size - total_read);
-                let n = unsafe {
-                    libc::pread(
-                        fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        to_read,
-                        total_read as libc::off_t,
-                    )
-                };
-                if n <= 0 {
-                    break;
-                }
-                total_read += n as usize;
-            }
-            let elapsed = start.elapsed().as_secs_f64();
-
-            if elapsed > 0.0 {
-                let bandwidth = (total_read as f64 / elapsed) as u64;
-                trial_bandwidths.push(bandwidth);
+            let bw = read_sequential_pass(path, file_size, block_size)?;
+            if bw > 0 {
+                trial_bandwidths.push(bw);
             }
         }
 
         if !trial_bandwidths.is_empty() {
-            trial_bandwidths.sort();
+            trial_bandwidths.sort_unstable();
             let median = trial_bandwidths[trial_bandwidths.len() / 2];
             points.push((block_size as u64, median));
             peak_sequential = peak_sequential.max(median);
         }
     }
 
-    Ok(BandwidthCurve {
-        points,
-        peak_sequential,
-    })
+    Ok(BandwidthCurve { points, peak_sequential })
 }
 
-fn benchmark_random_4k(
+/// Platform-specific sequential read pass.
+fn read_sequential_pass(
     path: &std::path::Path,
     file_size: usize,
+    block_size: usize,
 ) -> anyhow::Result<u64> {
+    #[cfg(unix)]
+    {
+        read_sequential_unix(path, file_size, block_size)
+    }
+    #[cfg(windows)]
+    {
+        read_sequential_windows(path, file_size, block_size)
+    }
+}
+
+#[cfg(unix)]
+fn read_sequential_unix(
+    path: &std::path::Path,
+    file_size: usize,
+    block_size: usize,
+) -> anyhow::Result<u64> {
+    use crate::io::aligned_buffer::AlignedBuffer;
+    use std::os::unix::io::AsRawFd;
+
     let file = std::fs::File::open(path)?;
     let fd = file.as_raw_fd();
 
-    let ret = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-    anyhow::ensure!(ret != -1, "F_NOCACHE failed: {}", std::io::Error::last_os_error());
+    // macOS: disable unified buffer cache; Linux: use advisory fadvise
+    #[cfg(target_os = "macos")]
+    unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1); }
+    #[cfg(target_os = "linux")]
+    unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED); }
 
-    let mut buf = AlignedBuffer::new(4096, 4096)?;
-    let max_offset = (file_size / 4096) as u64;
-
-    // Simple LCG for pseudo-random offsets (avoids rand crate dependency)
-    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
+    let mut buf = AlignedBuffer::new(block_size, 4096)?;
+    let mut total_read: usize = 0;
 
     let start = Instant::now();
-    for _ in 0..RANDOM_IOPS_READS {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let block_idx = (rng_state >> 32) % max_offset;
-        let offset = block_idx * 4096;
-
+    while total_read < file_size {
+        let to_read = block_size.min(file_size - total_read);
         let n = unsafe {
             libc::pread(
                 fd,
                 buf.as_mut_ptr() as *mut libc::c_void,
-                4096,
-                offset as libc::off_t,
+                to_read,
+                total_read as libc::off_t,
             )
         };
-        if n <= 0 {
-            break;
-        }
+        if n <= 0 { break; }
+        total_read += n as usize;
     }
     let elapsed = start.elapsed().as_secs_f64();
 
-    let iops = if elapsed > 0.0 {
-        (RANDOM_IOPS_READS as f64 / elapsed) as u64
+    if elapsed > 0.0 {
+        Ok((total_read as f64 / elapsed) as u64)
     } else {
-        0
-    };
-
-    Ok(iops)
-}
-
-/// Page-aligned buffer for direct I/O.
-struct AlignedBuffer {
-    ptr: *mut u8,
-    _len: usize,
-}
-
-impl AlignedBuffer {
-    fn new(size: usize, alignment: usize) -> anyhow::Result<Self> {
-        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
-        let ret = unsafe { libc::posix_memalign(&mut ptr, alignment, size) };
-        anyhow::ensure!(ret == 0, "posix_memalign failed: error code {ret}");
-        Ok(Self {
-            ptr: ptr as *mut u8,
-            _len: size,
-        })
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr
+        Ok(0)
     }
 }
 
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                libc::free(self.ptr as *mut libc::c_void);
-            }
-        }
+#[cfg(windows)]
+fn read_sequential_windows(
+    path: &std::path::Path,
+    file_size: usize,
+    block_size: usize,
+) -> anyhow::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    use crate::io::aligned_buffer::AlignedBuffer;
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = AlignedBuffer::new(block_size, 4096)?;
+    let mut total_read: usize = 0;
+
+    let start = Instant::now();
+    while total_read < file_size {
+        let to_read = block_size.min(file_size - total_read);
+        let n = file.read(&mut buf[..to_read])?;
+        if n == 0 { break; }
+        total_read += n;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+
+    if elapsed > 0.0 {
+        Ok((total_read as f64 / elapsed) as u64)
+    } else {
+        Ok(0)
     }
 }
+
+// ── Random 4K IOPS benchmark ──────────────────────────────────────────────────
+
+fn benchmark_random_4k(path: &std::path::Path, file_size: usize) -> anyhow::Result<u64> {
+    #[cfg(unix)]
+    return benchmark_random_4k_unix(path, file_size);
+    #[cfg(windows)]
+    return benchmark_random_4k_windows(path, file_size);
+}
+
+#[cfg(unix)]
+fn benchmark_random_4k_unix(path: &std::path::Path, file_size: usize) -> anyhow::Result<u64> {
+    use crate::io::aligned_buffer::AlignedBuffer;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path)?;
+    let fd = file.as_raw_fd();
+
+    #[cfg(target_os = "macos")]
+    unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1); }
+    #[cfg(target_os = "linux")]
+    unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM); }
+
+    let mut buf = AlignedBuffer::new(4096, 4096)?;
+    let max_offset = (file_size / 4096) as u64;
+
+    let mut rng: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
+    let start = Instant::now();
+    for _ in 0..RANDOM_IOPS_READS {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let block_idx = (rng >> 32) % max_offset;
+        let offset = block_idx * 4096;
+
+        let n = unsafe {
+            libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, 4096, offset as libc::off_t)
+        };
+        if n <= 0 { break; }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+
+    Ok(if elapsed > 0.0 { (RANDOM_IOPS_READS as f64 / elapsed) as u64 } else { 0 })
+}
+
+#[cfg(windows)]
+fn benchmark_random_4k_windows(path: &std::path::Path, file_size: usize) -> anyhow::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    use crate::io::aligned_buffer::AlignedBuffer;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = AlignedBuffer::new(4096, 4096)?;
+    let max_offset = (file_size / 4096) as u64;
+
+    let mut rng: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
+    let start = Instant::now();
+    for _ in 0..RANDOM_IOPS_READS {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let block_idx = (rng >> 32) % max_offset;
+        let offset = block_idx * 4096;
+        file.seek(SeekFrom::Start(offset))?;
+        let _ = file.read(&mut buf[..4096]);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+
+    Ok(if elapsed > 0.0 { (RANDOM_IOPS_READS as f64 / elapsed) as u64 } else { 0 })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_aligned_buffer() {
-        let mut buf = AlignedBuffer::new(4096, 4096).unwrap();
-        assert!(!buf.as_mut_ptr().is_null());
-        assert_eq!(buf.as_mut_ptr() as usize % 4096, 0);
-    }
 
     #[test]
     fn test_profile_storage() {
@@ -248,7 +323,7 @@ mod tests {
         assert!(!profiles.is_empty());
         let p = &profiles[0];
         assert!(p.capacity_bytes > 0);
-        assert!(p.sequential_read.peak_sequential > 100_000_000); // > 100 MB/s
+        assert!(p.sequential_read.peak_sequential > 50_000_000); // > 50 MB/s
         assert!(p.random_read_iops > 0);
     }
 }

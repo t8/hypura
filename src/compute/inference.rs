@@ -1115,31 +1115,56 @@ pub fn generate_with_nvme_scheduling(
     })
 }
 
-/// Query total physical RAM via sysctl (macOS).
+/// Query total physical RAM.
+///
+/// macOS: `hw.memsize` sysctl.
+/// Linux/Windows: `sysinfo` crate (no privileged API needed).
 fn total_physical_memory() -> u64 {
-    unsafe {
-        let mut size: u64 = 0;
-        let mut len = std::mem::size_of::<u64>();
-        let name = b"hw.memsize\0";
-        libc::sysctlbyname(
-            name.as_ptr() as *const i8,
-            &mut size as *mut u64 as *mut libc::c_void,
-            &mut len as *mut usize,
-            std::ptr::null_mut(),
-            0,
-        );
-        if size == 0 { 32 * (1 << 30) } else { size }
+    #[cfg(target_os = "macos")]
+    {
+        let total = unsafe {
+            let mut size: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            let name = b"hw.memsize\0";
+            libc::sysctlbyname(
+                name.as_ptr() as *const i8,
+                &mut size as *mut u64 as *mut libc::c_void,
+                &mut len as *mut usize,
+                std::ptr::null_mut(),
+                0,
+            );
+            size
+        };
+        if total == 0 { 32 * (1 << 30) } else { total }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total = sys.total_memory();
+        if total == 0 { 16 * (1 << 30) } else { total }
     }
 }
 
 fn num_performance_cores() -> i32 {
-    crate::profiler::cpu::sysctl_u32("hw.perflevel0.logicalcpu")
-        .map(|n| n as i32)
-        .unwrap_or_else(|_| {
-            std::thread::available_parallelism()
-                .map(|n| (n.get() / 2).max(1) as i32)
-                .unwrap_or(4)
-        })
+    // macOS: use hw.perflevel0 (P-cores only)
+    #[cfg(target_os = "macos")]
+    {
+        crate::profiler::cpu::sysctl_u32("hw.perflevel0.logicalcpu")
+            .map(|n| n as i32)
+            .unwrap_or_else(|_| {
+                std::thread::available_parallelism()
+                    .map(|n| (n.get() / 2).max(1) as i32)
+                    .unwrap_or(4)
+            })
+    }
+    // Non-macOS: use half of logical CPUs as a conservative estimate for I/O threads
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(1) as i32)
+            .unwrap_or(4)
+    }
 }
 
 #[cfg(test)]

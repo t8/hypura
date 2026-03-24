@@ -1,33 +1,36 @@
+use std::alloc::{Layout, alloc, dealloc};
 use std::ops::{Deref, DerefMut};
 
-/// Page-aligned buffer for direct I/O (F_NOCACHE).
-/// Allocated via `posix_memalign`, freed via `libc::free`.
+/// Page-aligned buffer for direct I/O.
+///
+/// Uses Rust's global allocator (`std::alloc`) with an explicit alignment,
+/// which works on macOS, Linux, and Windows without POSIX-specific APIs.
 pub struct AlignedBuffer {
     ptr: *mut u8,
     len: usize,
+    layout: Layout,
 }
 
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
-    /// Allocate `len` bytes aligned to `alignment` (must be a power of 2, typically 4096).
+    /// Allocate `len` bytes aligned to `alignment` (must be a power of 2, ≥ 1).
     pub fn new(len: usize, alignment: usize) -> std::io::Result<Self> {
         if len == 0 {
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
                 len: 0,
+                layout: Layout::new::<u8>(),
             });
         }
-        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
-        let ret = unsafe { libc::posix_memalign(&mut ptr, alignment, len) };
-        if ret != 0 {
-            return Err(std::io::Error::from_raw_os_error(ret));
+        let layout = Layout::from_size_align(len, alignment)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory));
         }
-        Ok(Self {
-            ptr: ptr as *mut u8,
-            len,
-        })
+        Ok(Self { ptr, len, layout })
     }
 
     pub fn len(&self) -> usize {
@@ -63,7 +66,7 @@ impl DerefMut for AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { libc::free(self.ptr as *mut libc::c_void) }
+            unsafe { dealloc(self.ptr, self.layout) }
         }
     }
 }
