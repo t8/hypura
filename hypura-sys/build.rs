@@ -45,8 +45,8 @@ fn main() {
     let include_ggml_internal = llama_dir.join("ggml/src");
     cc::Build::new()
         .file(src_dir.join("hypura_buft.c"))
-        .include(&llama_dir.join("include"))
-        .include(&llama_dir.join("ggml/include"))
+        .include(llama_dir.join("include"))
+        .include(llama_dir.join("ggml/include"))
         .include(&include_ggml_internal)
         .include(&src_dir)
         .flag("-std=c11")

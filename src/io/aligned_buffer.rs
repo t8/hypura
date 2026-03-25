@@ -37,6 +37,11 @@ impl AlignedBuffer {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Returns a raw pointer to the buffer's contents.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
 }
 
 impl Deref for AlignedBuffer {
