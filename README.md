@@ -70,7 +70,7 @@ All benchmarks on **M1 Max, 32 GB unified memory, ~5.1 GB/s NVMe sequential read
 Hypura builds from source with Cargo. You'll need Rust 1.75+ and CMake (for the vendored llama.cpp).
 
 ```sh
-git clone --recurse-submodules https://github.com/hypura/hypura.git
+git clone --recurse-submodules https://github.com/t8/hypura.git
 cd hypura
 cargo build --release
 ```
