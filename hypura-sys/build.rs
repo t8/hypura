@@ -19,6 +19,7 @@ fn main() {
         .define("GGML_CPU", "ON")
         .define("GGML_BLAS", "OFF")
         .define("GGML_OPENMP", "OFF")
+        .define("GGML_CPU_REPACK", "OFF")
         .build();
 
     let lib_dir = dst.join("lib");
