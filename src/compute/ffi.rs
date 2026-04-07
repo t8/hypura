@@ -133,7 +133,14 @@ impl LlamaModel {
     }
 
     /// Tokenize text into token IDs.
-    pub fn tokenize(&self, text: &str, add_bos: bool) -> Vec<i32> {
+    ///
+    /// `add_bos`: ask the tokenizer to add BOS/EOS as appropriate (controlled
+    /// by `tokenizer.ggml.add_bos_token` in the GGUF metadata).
+    /// `parse_special`: when true, special tokens like `<start_of_turn>` in the
+    /// input text are matched against the vocab and tokenized as their special
+    /// IDs. When false, they are tokenized as raw bytes (which produces
+    /// gibberish when feeding chat-templated prompts to instruction models).
+    pub fn tokenize(&self, text: &str, add_bos: bool, parse_special: bool) -> Vec<i32> {
         let c_text = CString::new(text).unwrap_or_default();
         let max = (text.len() as i32 + 32).max(64);
         let mut tokens = vec![0i32; max as usize];
@@ -146,7 +153,7 @@ impl LlamaModel {
                 tokens.as_mut_ptr(),
                 max,
                 add_bos,
-                false,
+                parse_special,
             )
         };
 
@@ -161,7 +168,7 @@ impl LlamaModel {
                     tokens.as_mut_ptr(),
                     -n,
                     add_bos,
-                    false,
+                    parse_special,
                 )
             };
             tokens.truncate(n2.max(0) as usize);

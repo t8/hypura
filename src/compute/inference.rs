@@ -282,7 +282,7 @@ pub fn generate_from_loaded(
 
     let mut sampler = LlamaSampler::new(sampling);
 
-    let tokens = loaded.model.tokenize(prompt, true);
+    let tokens = loaded.model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
@@ -506,7 +506,7 @@ pub fn generate_blocking(
     let mut sampler = LlamaSampler::new(&config.sampling);
 
     // Tokenize prompt
-    let tokens = model.tokenize(prompt, true);
+    let tokens = model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
@@ -890,7 +890,7 @@ pub fn generate_with_nvme_scheduling(
     };
 
     // Tokenize prompt
-    let tokens = model.tokenize(prompt, true);
+    let tokens = model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
