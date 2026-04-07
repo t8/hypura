@@ -24,19 +24,29 @@ pub struct ExpertLayout {
     pub expert_permutation: Option<Vec<u32>>,
 }
 
-/// Identifies which type of expert FFN tensor this is (gate, up, or down).
-/// Used as a cache key dimension — each expert has 3 tensor types.
+/// Identifies which type of expert FFN tensor this is. Used as a cache key
+/// dimension. Most architectures (Mixtral-style) split into 3 separate fused
+/// tensors (Gate/Up/Down). Some architectures (gemma4) fuse Gate and Up into
+/// a single tensor, leaving 2 tensors per layer (GateUp/Down).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpertTensorType {
     Gate,
     Up,
     Down,
+    /// Fused gate+up tensor (e.g., gemma4's `ffn_gate_up_exps.weight`).
+    GateUp,
 }
 
 impl ExpertTensorType {
     /// Parse from a tensor name like `blk.N.ffn_gate_exps.weight`.
+    /// Note: `ffn_gate_up_exps` must be checked before `ffn_gate_exps` and
+    /// `ffn_up_exps` to avoid mismatches (the substring `ffn_gate_exps` does
+    /// not appear in `ffn_gate_up_exps`, but being explicit guards against
+    /// future naming variants).
     pub fn from_name(name: &str) -> Option<Self> {
-        if name.contains("ffn_gate_exps") {
+        if name.contains("ffn_gate_up_exps") {
+            Some(Self::GateUp)
+        } else if name.contains("ffn_gate_exps") {
             Some(Self::Gate)
         } else if name.contains("ffn_up_exps") {
             Some(Self::Up)
@@ -109,6 +119,10 @@ mod tests {
         assert_eq!(
             ExpertTensorType::from_name("blk.0.ffn_down_exps.weight"),
             Some(ExpertTensorType::Down)
+        );
+        assert_eq!(
+            ExpertTensorType::from_name("blk.0.ffn_gate_up_exps.weight"),
+            Some(ExpertTensorType::GateUp)
         );
         assert_eq!(
             ExpertTensorType::from_name("blk.0.ffn_gate.weight"),
