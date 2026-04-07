@@ -77,6 +77,17 @@ impl GgufValue {
             _ => None,
         }
     }
+
+    /// Coerce an Array of integer-typed elements into a `Vec<u32>`. Returns
+    /// None for non-array values or arrays whose elements aren't integer-typed.
+    /// Used for per-layer metadata like gemma4's `attention.head_count_kv`,
+    /// which is encoded as `arr[i32, n_layer]`.
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(elems) => elems.iter().map(|e| e.as_u32()).collect(),
+            _ => None,
+        }
+    }
 }
 
 /// GGML quantization / data types.
@@ -309,6 +320,20 @@ impl GgufFile {
                 .get(&format!("{arch}.{key}"))
                 .and_then(|v| v.as_u32())
         })
+    }
+
+    /// Get a `Vec<u32>` metadata value, trying architecture-prefixed keys.
+    /// Returns None if the key is missing or not an array of integer values.
+    pub fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_u32_array())
+            .or_else(|| {
+                let arch = self.get_string("general.architecture")?;
+                self.metadata
+                    .get(&format!("{arch}.{key}"))
+                    .and_then(|v| v.as_u32_array())
+            })
     }
 }
 
