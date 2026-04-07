@@ -42,9 +42,18 @@ impl ModelMetadata {
             .or_else(|| gguf.get_u32("attention.head_count"))
             .unwrap_or(0);
 
+        // Some architectures (e.g. gemma4) encode `attention.head_count_kv` as a
+        // per-layer array instead of a scalar — different layers can have
+        // different KV head counts (mixed full / sliding-window attention).
+        // Fall back to the array case and take the maximum so KV cache
+        // reservation stays conservative (over-reserves rather than under).
         let num_kv_heads = gguf
             .get_u32(&format!("{arch}.attention.head_count_kv"))
             .or_else(|| gguf.get_u32("attention.head_count_kv"))
+            .or_else(|| {
+                gguf.get_u32_array("attention.head_count_kv")
+                    .and_then(|arr| arr.into_iter().max())
+            })
             .unwrap_or(num_heads);
 
         let vocab_size = gguf
