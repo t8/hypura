@@ -1,13 +1,11 @@
-use std::path::Path;
-
 use hypura::model::{gguf::GgufFile, metadata::ModelMetadata};
 use hypura::profiler;
 use hypura::scheduler::estimator::{estimate_performance, EstimateConfidence};
-use hypura::scheduler::placement::{compute_placement, summarize_placement};
+use hypura::scheduler::placement::{compute_placement_with_context, summarize_placement};
 
 use super::fmt_util::{format_bytes, format_params};
 
-pub fn run(model_path: &str) -> anyhow::Result<()> {
+pub fn run(model_path: &str, context_length: u32) -> anyhow::Result<()> {
     let resolved_path = hypura::server::registry::resolve_model_path(model_path)?;
     let path = resolved_path.as_path();
 
@@ -31,8 +29,8 @@ pub fn run(model_path: &str) -> anyhow::Result<()> {
     let metadata = ModelMetadata::from_gguf(&gguf)?;
 
     // Compute placement
-    println!("Computing optimal placement...");
-    let placement = compute_placement(&gguf, &hardware)?;
+    println!("Computing optimal placement for context: {context_length} tokens...");
+    let placement = compute_placement_with_context(&gguf, &hardware, context_length)?;
 
     // Estimate performance
     let estimate = estimate_performance(&gguf, &metadata, &hardware, &placement)?;
@@ -93,14 +91,19 @@ pub fn run(model_path: &str) -> anyhow::Result<()> {
 
     println!();
     println!("  KV Cache");
+    let quant_label = match placement.kv_cache_plan.kv_quantization {
+        Some(hypura::scheduler::types::KvQuantization::Q4_0) => "Q4_0",
+        Some(hypura::scheduler::types::KvQuantization::Q8_0) => "Q8_0",
+        _ => "FP16",
+    };
     println!(
-        "    Hot window:     {} tokens ({:?}, FP16)    {}",
+        "    Hot window:     {} tokens ({:?}, {quant_label})    {}",
         placement.kv_cache_plan.hot_window_tokens,
         placement.kv_cache_plan.hot_tier,
         format_bytes(placement.kv_cache_plan.hot_bytes),
     );
     println!(
-        "    Warm window:    {} tokens ({:?}, Q8)      {}",
+        "    Warm window:    {} tokens ({:?}, {quant_label})      {}",
         placement.kv_cache_plan.warm_window_tokens,
         placement.kv_cache_plan.warm_tier,
         format_bytes(placement.kv_cache_plan.warm_bytes),

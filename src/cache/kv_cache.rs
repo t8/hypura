@@ -78,6 +78,19 @@ impl KvCacheManager {
     pub fn position(&self) -> u32 {
         self.current_pos
     }
+
+    /// Save the current context / KV state to disk.
+    pub fn save_to_disk(&self, ctx: &LlamaContext, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        ctx.save_state_to_file(path)
+    }
+
+    /// Restore the context / KV state from disk.
+    pub fn restore_from_disk(&mut self, ctx: &mut LlamaContext, path: &std::path::Path) -> anyhow::Result<()> {
+        ctx.load_state_from_file(path)
+    }
 }
 
 #[cfg(test)]
