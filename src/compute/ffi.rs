@@ -335,6 +335,39 @@ impl LlamaContext {
         }
     }
 
+    /// Save context/KV state to a disk file.
+    pub fn save_state_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid unicode path"))?;
+        let c_path = std::ffi::CString::new(path_str)?;
+
+        let ok = unsafe { hypura_sys::llama_state_save_file(self.ptr, c_path.as_ptr(), std::ptr::null(), 0) };
+        if !ok {
+            anyhow::bail!("Failed to save llama context state to {}", path.display());
+        }
+        tracing::info!("Saved KV cache state to {}", path.display());
+        Ok(())
+    }
+
+    /// Load context/KV state from a disk file.
+    pub fn load_state_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        if !path.exists() {
+            anyhow::bail!("State file {} does not exist", path.display());
+        }
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid unicode path"))?;
+        let c_path = std::ffi::CString::new(path_str)?;
+
+        let ok = unsafe { hypura_sys::llama_state_load_file(self.ptr, c_path.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
+        if !ok {
+            anyhow::bail!("Failed to load llama context state from {}", path.display());
+        }
+        tracing::info!("Loaded KV cache state from {}", path.display());
+        Ok(())
+    }
+
     pub fn as_ptr(&self) -> *mut hypura_sys::llama_context {
         self.ptr
     }

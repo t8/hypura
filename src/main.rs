@@ -22,6 +22,9 @@ enum Commands {
     Estimate {
         /// Path to model file or HuggingFace model ID
         model: String,
+        /// Maximum context length to estimate placement and KV cache for
+        #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "8192")]
+        context: u32,
     },
     /// List all available local and Ollama models
     List {
@@ -46,7 +49,7 @@ enum Commands {
         /// Path to model file
         model: String,
         /// Maximum context length
-        #[arg(long, default_value = "4096")]
+        #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "4096")]
         context: u32,
         /// Single prompt (non-interactive mode)
         #[arg(long)]
@@ -69,7 +72,7 @@ enum Commands {
         #[arg(long, default_value = "8080")]
         port: u16,
         /// Default context length (can be overridden per request via num_ctx)
-        #[arg(long, default_value = "4096")]
+        #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "4096")]
         context: u32,
         /// Custom models directory to scan
         #[arg(long)]
@@ -133,7 +136,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Profile { force } => cli::profile::run(force),
-        Commands::Estimate { model } => cli::estimate::run(&model),
+        Commands::Estimate { model, context } => cli::estimate::run(&model, context),
         Commands::List {
             models_dir,
             ollama_models,
