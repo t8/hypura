@@ -145,7 +145,7 @@ fn compute_tier_capacities(
     // For large contexts (>= 32k or > 4GB raw KV), we auto-quantize to Q4_0 (0.28x) or Q8_0 (0.53x)
     let kv_scale = if context_length >= 32768 || raw_kv > (4u64 << 30) {
         0.28 // Q4_0
-    } else if context_length >= 16384 || raw_kv > (1u64 << 30) {
+    } else if context_length >= 16384 || raw_kv > (500 * (1 << 20)) {
         0.53 // Q8_0
     } else {
         1.0 // F16
