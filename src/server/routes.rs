@@ -164,6 +164,10 @@ async fn generate_handler(
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping generate");
+            return;
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -191,7 +195,12 @@ async fn generate_handler(
         );
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/x-ndjson")],
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
@@ -234,6 +243,10 @@ async fn chat_handler(
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping chat");
+            return;
+        }
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&req_messages, req_tools.as_ref(), Some(&full_hint));
@@ -259,7 +272,12 @@ async fn chat_handler(
             streaming::ndjson_chat_stream(model_name, token_rx, result_rx, request_start, 0);
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/x-ndjson")],
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
@@ -503,6 +521,10 @@ async fn v1_chat_completions_handler(
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping OpenAI chat");
+            return;
+        }
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&internal_messages, req_tools.as_ref(), Some(&full_hint));
@@ -533,7 +555,12 @@ async fn v1_chat_completions_handler(
         );
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/event-stream")],
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
@@ -641,6 +668,10 @@ async fn v1_completions_handler(
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping OpenAI completion");
+            return;
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -668,7 +699,12 @@ async fn v1_completions_handler(
         );
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/event-stream")],
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
