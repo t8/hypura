@@ -124,6 +124,11 @@ impl LlamaModel {
         unsafe { hypura_sys::llama_model_n_layer(self.ptr) }
     }
 
+    /// Sliding-window attention size (`0` if the model does not use SWA).
+    pub fn n_swa(&self) -> i32 {
+        unsafe { hypura_sys::llama_model_n_swa(self.ptr) }
+    }
+
     /// Get the model's embedded chat template, if any.
     pub fn chat_template(&self) -> Option<String> {
         let ptr = unsafe { hypura_sys::llama_model_chat_template(self.ptr, ptr::null()) };
@@ -335,8 +340,93 @@ impl LlamaContext {
         }
     }
 
+    /// Save context/KV state to a disk file.
+    pub fn save_state_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid unicode path"))?;
+        let c_path = std::ffi::CString::new(path_str)?;
+
+        let ok = unsafe { hypura_sys::llama_state_save_file(self.ptr, c_path.as_ptr(), std::ptr::null(), 0) };
+        if !ok {
+            anyhow::bail!("Failed to save llama context state to {}", path.display());
+        }
+        tracing::info!("Saved KV cache state to {}", path.display());
+        Ok(())
+    }
+
+    /// Load context/KV state from a disk file.
+    pub fn load_state_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        if !path.exists() {
+            anyhow::bail!("State file {} does not exist", path.display());
+        }
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid unicode path"))?;
+        let c_path = std::ffi::CString::new(path_str)?;
+
+        let ok = unsafe { hypura_sys::llama_state_load_file(self.ptr, c_path.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
+        if !ok {
+            anyhow::bail!("Failed to load llama context state from {}", path.display());
+        }
+        tracing::info!("Loaded KV cache state from {}", path.display());
+        Ok(())
+    }
+
     pub fn as_ptr(&self) -> *mut hypura_sys::llama_context {
         self.ptr
+    }
+
+    /// Clear all KV / recurrent sequence metadata so decoding starts fresh from position 0.
+    pub fn clear_memory(&mut self) {
+        let mem = unsafe { hypura_sys::llama_get_memory(self.ptr) };
+        if !mem.is_null() {
+            unsafe { hypura_sys::llama_memory_clear(mem, false) };
+        }
+    }
+
+    /// Trim sequence 0 KV memory to retain `[0, keep_len)` and remove `[keep_len, inf)`.
+    ///
+    /// Returns `keep_len` if the prefix remains valid (including SWA window & recurrent state
+    /// checks), or `0` after clearing memory if partial sequence removal is unsupported or
+    /// would invalidate the sliding-window cache.
+    pub fn trim_kv_to_prefix(&mut self, keep_len: usize, n_swa: i32) -> usize {
+        if keep_len == 0 {
+            self.clear_memory();
+            return 0;
+        }
+
+        let mem = unsafe { hypura_sys::llama_get_memory(self.ptr) };
+        if mem.is_null() {
+            return 0;
+        }
+
+        let pos_max = unsafe { hypura_sys::llama_memory_seq_pos_max(mem, 0) };
+        let target_pos_max = (keep_len as i32) - 1;
+
+        if pos_max < target_pos_max {
+            self.clear_memory();
+            return 0;
+        }
+
+        if pos_max > target_pos_max {
+            let ok = unsafe { hypura_sys::llama_memory_seq_rm(mem, 0, keep_len as i32, -1) };
+            if !ok {
+                self.clear_memory();
+                return 0;
+            }
+        }
+
+        let new_min = unsafe { hypura_sys::llama_memory_seq_pos_min(mem, 0) };
+        let new_max = unsafe { hypura_sys::llama_memory_seq_pos_max(mem, 0) };
+        let swa_valid = n_swa <= 0 || new_min == 0 || new_min <= (keep_len as i32 - n_swa);
+
+        if new_min < 0 || new_max != target_pos_max || !swa_valid {
+            self.clear_memory();
+            return 0;
+        }
+
+        keep_len
     }
 }
 

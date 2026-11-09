@@ -4,6 +4,45 @@ All notable changes to the **Hypura** project are documented in this file.
 
 ---
 
+## [0.2.5] - 2026-10-06
+
+### ✨ Features & Enhancements
+
+#### 1. Dynamic Context Scaling for Agentic Coding (64k–128k tokens)
+* **Context Parameter in CLI & API (`src/main.rs`, `src/cli/estimate.rs`):**
+  * Added `-c, --context <N>` (with visible alias `--ctx-size`, default: 8192) to `hypura estimate <model>` to inspect layer offload trade-offs and KV memory consumption upfront.
+  * Standardized visible alias `--ctx-size` across `hypura run` and `hypura serve` to match Ollama/OpenAI API flags.
+  * Updated `hypura estimate` terminal output to display the auto-selected KV quantization format (`FP16`, `Q8_0`, `Q4_0`).
+
+#### 2. Adaptive 4-Bit & 8-Bit KV Cache Quantization (`src/scheduler/placement.rs`)
+* **Auto-Selected Quantization (`compute_kv_cache_plan`):**
+  * Automatically switches to `Q4_0` for contexts $\ge 32\text{k}$ tokens or when FP16 KV cache exceeds 4 GB (saving ~72% memory).
+  * Automatically switches to `Q8_0` for contexts $\ge 16\text{k}$ tokens or when memory headroom is constrained (saving ~47% memory).
+* **Quantized Headroom Accounting (`compute_tier_capacities`):**
+  * Scaled KV headroom reservation by the actual quantization factor ($0.28\times$ for Q4_0, $0.53\times$ for Q8_0) during placement calculation, preventing premature eviction of model layers to disk while keeping Metal working sets safe.
+
+#### 3. KV Cache & Context Disk Serialization (`src/compute/ffi.rs`, `src/cache/kv_cache.rs`)
+* Added `save_state_to_file` and `load_state_from_file` to `LlamaContext`, bridging to `llama_state_save_file` and `llama_state_load_file`.
+* Added `save_to_disk` and `restore_from_disk` in `KvCacheManager` for checkpointing long agent prompts and restoring sessions across restarts.
+
+#### 4. Startup Script Flexibility & CLI Parameter Forwarding (`start_hypura_funnel.sh`)
+* Added dynamic option parsing supporting `-c / --context / --ctx-size`, `-p / --port`, and arbitrary trailing Hypura CLI flags.
+* Default baseline context increased to **32k** (`32768`) for modern long-horizon agent coding workloads.
+* Supports runtime environment variables `HYPURA_CONTEXT`, `HYPURA_PORT`, and `HYPURA_EXTRA_ARGS`.
+* **Usage Examples:**
+  ```bash
+  # Launch with 64k context window (all models dynamic on-demand)
+  ./start_hypura_funnel.sh -c 65536
+
+  # Launch a specific model pre-warmed with 128k context on port 8080
+  ./start_hypura_funnel.sh qwen2.5-coder-32b -c 131072 -p 8080
+
+  # Pass custom scan directories or extra flags through to hypura serve
+  ./start_hypura_funnel.sh -c 65536 --models-dir /Volumes/Models/gguf
+  ```
+
+---
+
 ## [0.2.4] - 2026-09-09
 
 ### ✨ Features & Enhancements

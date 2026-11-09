@@ -56,11 +56,19 @@ pub struct GenerationResult {
     pub perf: PerfData,
 }
 
+/// Persistent inference context & token history cached across HTTP requests for prefix KV reuse.
+struct CachedSession {
+    ctx: LlamaContext,
+    n_ctx: u32,
+    tokens: Vec<i32>,
+}
+
 /// A loaded model that can serve multiple generation requests.
 ///
-/// Holds the llama.cpp backend, model, and NVMe scheduling state.
-/// Context + sampler are created fresh per request (cheap to create, expensive to keep).
+/// Holds the llama.cpp backend, model, persistent KV session, and NVMe scheduling state.
+/// Note: `cached_session` is declared first so `LlamaContext` drops before `LlamaModel`.
 pub struct LoadedModel {
+    cached_session: Option<CachedSession>,
     pub _backend: LlamaBackend,
     pub model: LlamaModel,
     pub config: InferenceConfig,
@@ -79,6 +87,8 @@ unsafe impl Send for LoadedModel {}
 
 impl Drop for LoadedModel {
     fn drop(&mut self) {
+        // Free LlamaContext before stopping the NVMe I/O pool or freeing LlamaModel
+        self.cached_session = None;
         if let Some(ref state) = self.prefetch_state {
             state.stop_io_pool();
         }
@@ -126,6 +136,7 @@ pub fn load_model(
     if !has_nvme {
         let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
         return Ok(LoadedModel {
+            cached_session: None,
             _backend: backend,
             model,
             config: config.clone(),
@@ -239,6 +250,7 @@ pub fn load_model(
     }
 
     Ok(LoadedModel {
+        cached_session: None,
         _backend: backend,
         model,
         config: config.clone(),
@@ -442,7 +454,8 @@ pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool 
 
 /// Generate text from a pre-loaded model.
 ///
-/// Creates a fresh context + sampler per request. The model itself is reused.
+/// Reuses a persistent `LlamaContext` and cached prompt KV prefix across requests
+/// when compatible, and aborts promptly if the HTTP client disconnects.
 pub fn generate_from_loaded(
     loaded: &mut LoadedModel,
     params: GenerateFromLoadedParams<'_>,
@@ -454,7 +467,14 @@ pub fn generate_from_loaded(
         telemetry,
     } = params;
 
-    let config = &loaded.config;
+    if token_tx.is_closed() {
+        anyhow::bail!("Generation cancelled: client disconnected before start");
+    }
+
+    let n_ctx_limit = loaded.config.n_ctx;
+    let n_batch = loaded.config.n_batch;
+    let n_threads = loaded.config.n_threads;
+
     let tokens = loaded.model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
@@ -462,37 +482,59 @@ pub fn generate_from_loaded(
     // Dynamic context calculation: keep within config.n_ctx bounds to ensure
     // KV cache allocations stay within the reserved Metal working set limit.
     let gen_headroom = sampling.max_tokens.min(4096).max(512);
-    let effective_ctx = (prompt_len + gen_headroom).min(config.n_ctx).max(1024);
+    let effective_ctx = (prompt_len + gen_headroom).min(n_ctx_limit).max(1024);
 
-    // Build context — with or without NVMe callback, respecting KV cache quantization
-    let mut ctx = if let Some(ref prefetch_state) = loaded.prefetch_state {
-        let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
-        let ctx = LlamaContext::new_with_callback_and_kv(
-            &loaded.model,
-            effective_ctx,
-            config.n_batch,
-            config.n_threads,
-            Some(eval_callback),
-            state_ptr,
-            loaded.kv_quantization,
-        )?;
-        // Immediately convert back to avoid leak — the PrefetchState is kept alive
-        // by the Arc in LoadedModel, not by this raw pointer.
-        unsafe {
-            Arc::from_raw(state_ptr as *const PrefetchState);
-        }
-        ctx
-    } else {
-        LlamaContext::new_with_callback_and_kv(
-            &loaded.model,
-            effective_ctx,
-            config.n_batch,
-            config.n_threads,
-            None,
-            std::ptr::null_mut(),
-            loaded.kv_quantization,
-        )?
-    };
+    let need_new_ctx = loaded
+        .cached_session
+        .as_ref()
+        .map_or(true, |s| s.n_ctx < effective_ctx);
+
+    if need_new_ctx {
+        // Release previous Metal KV buffers first so old and new contexts never coexist
+        loaded.cached_session = None;
+
+        // Allocate with a 4k growth cushion (capped at n_ctx_limit) so multi-turn
+        // coding-agent sessions don't reallocate KV buffers on every turn.
+        let alloc_ctx = effective_ctx
+            .saturating_add(4096)
+            .min(n_ctx_limit)
+            .max(effective_ctx);
+
+        let ctx = if let Some(ref prefetch_state) = loaded.prefetch_state {
+            let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
+            let ctx_res = LlamaContext::new_with_callback_and_kv(
+                &loaded.model,
+                alloc_ctx,
+                n_batch,
+                n_threads,
+                Some(eval_callback),
+                state_ptr,
+                loaded.kv_quantization,
+            );
+            // Immediately convert back to avoid leak — the PrefetchState is kept alive
+            // by the Arc in LoadedModel, not by this raw pointer.
+            unsafe {
+                Arc::from_raw(state_ptr as *const PrefetchState);
+            }
+            ctx_res?
+        } else {
+            LlamaContext::new_with_callback_and_kv(
+                &loaded.model,
+                alloc_ctx,
+                n_batch,
+                n_threads,
+                None,
+                std::ptr::null_mut(),
+                loaded.kv_quantization,
+            )?
+        };
+
+        loaded.cached_session = Some(CachedSession {
+            ctx,
+            n_ctx: alloc_ctx,
+            tokens: Vec::new(),
+        });
+    }
 
     let mut sampler = LlamaSampler::new(sampling);
 
@@ -514,12 +556,50 @@ pub fn generate_from_loaded(
         &tokens[..]
     };
 
+    let n_swa = loaded.model.n_swa();
+    let session = loaded.cached_session.as_mut().unwrap();
+
+    // Reuse longest valid common token prefix already present in KV memory,
+    // leaving at least 1 token to decode so logits are freshly computed for sampling.
+    let common_len = session
+        .tokens
+        .iter()
+        .zip(eval_tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let desired_reuse = common_len.min(eval_tokens.len().saturating_sub(1));
+    let reused_len = session.ctx.trim_kv_to_prefix(desired_reuse, n_swa);
+    session.tokens.truncate(reused_len);
+
+    if reused_len > 0 {
+        tracing::info!(
+            "KV prefix cache hit: reused {}/{} prompt tokens (decoding {} new tokens)",
+            reused_len,
+            eval_tokens.len(),
+            eval_tokens.len() - reused_len
+        );
+    }
+
     let prompt_start = Instant::now();
-    let batch_size = config.n_batch as usize;
-    for chunk in eval_tokens.chunks(batch_size) {
-        ctx.decode(chunk)?;
+    let batch_size = n_batch as usize;
+    for chunk in eval_tokens[reused_len..].chunks(batch_size) {
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected during prompt prefill; aborting generation");
+            anyhow::bail!("Generation cancelled: client disconnected");
+        }
+        if let Err(e) = session.ctx.decode(chunk) {
+            session.ctx.clear_memory();
+            session.tokens.clear();
+            return Err(e);
+        }
+        session.tokens.extend_from_slice(chunk);
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+
+    if token_tx.is_closed() {
+        tracing::info!("Client disconnected after prompt prefill; aborting generation");
+        anyhow::bail!("Generation cancelled: client disconnected");
+    }
 
     // Generation loop
     let mut generated_text = String::new();
@@ -527,7 +607,7 @@ pub fn generate_from_loaded(
     let gen_start = Instant::now();
 
     for _ in 0..sampling.max_tokens {
-        let token_id = sampler.sample(&mut ctx, -1);
+        let token_id = sampler.sample(&mut session.ctx, -1);
         let is_eog = loaded.model.is_eog(token_id);
         let is_control = loaded.model.is_control(token_id);
         let piece = loaded.model.token_to_piece(token_id);
@@ -579,10 +659,15 @@ pub fn generate_from_loaded(
             break;
         }
 
-        ctx.decode(&[token_id])?;
+        if let Err(e) = session.ctx.decode(&[token_id]) {
+            session.ctx.clear_memory();
+            session.tokens.clear();
+            return Err(e);
+        }
+        session.tokens.push(token_id);
     }
 
-    let perf = ctx.perf();
+    let perf = session.ctx.perf();
     let total_gen_time = gen_start.elapsed().as_secs_f64();
     let avg_tps = if total_gen_time > 0.0 {
         n_generated as f64 / total_gen_time
@@ -611,7 +696,7 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
     let arch_lower = metadata.architecture.to_lowercase();
     let is_mla = arch_lower.contains("glm4moe") || arch_lower.contains("deepseek2") || arch_lower.contains("deepseek3");
 
-    let kv_on_gpu = if is_mla {
+    let raw_kv_on_gpu = if is_mla {
         // 576 bytes per layer * Q8_0 (1 byte/elem) * layers * context
         576 * metadata.num_layers as u64 * context_length as u64
     } else {
@@ -626,6 +711,19 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
             * 2
             * context_length as u64
     };
+
+    // Scale GPU KV reservation by the auto-selected KV cache quantization (Q4_0 / Q8_0),
+    // matching compute_tier_capacities and compute_kv_cache_plan in placement.rs.
+    let kv_scale = if is_mla {
+        1.0 // already compressed above
+    } else if context_length >= 32768 || raw_kv_on_gpu > (4u64 << 30) {
+        0.28 // Q4_0
+    } else if context_length >= 16384 || raw_kv_on_gpu > (500 * (1 << 20)) {
+        0.53 // Q8_0
+    } else {
+        1.0 // F16
+    };
+    let kv_on_gpu = (raw_kv_on_gpu as f64 * kv_scale) as u64;
 
     // Reserve headroom for Metal compute graph splits (150+ splits on dense models), SSM recurrent state buffers, and display compositor
     let is_ssm_hybrid = arch_lower.contains("gemma")
@@ -1552,5 +1650,70 @@ mod tests {
         assert!(should_stop_early("Done.\n### Human:", &custom_stops));
         // Normal text should not stop
         assert!(!should_stop_early("Here are 3 weather stations with the lowest temperature:\n1. Station A", &empty_stops));
+    }
+
+    #[test]
+    fn test_compute_gpu_budget_applies_kv_quantization_at_32k() {
+        use crate::profiler::types::{CpuProfile, GpuBackend, GpuProfile, MemoryProfile, SystemInfo};
+        use chrono::Utc;
+
+        let hw = HardwareProfile {
+            timestamp: Utc::now(),
+            system: SystemInfo {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                machine_model: "Mac16,7".into(),
+                total_cores: 14,
+            },
+            memory: MemoryProfile {
+                total_bytes: 24 * (1 << 30),
+                available_bytes: 20 * (1 << 30),
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                is_unified: true,
+            },
+            gpu: Some(GpuProfile {
+                name: "Apple M4 Pro".into(),
+                vram_bytes: 19069 * 1024 * 1024, // 19069 MiB Metal working set on 24 GB M4 Pro
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                fp16_tflops: 20.0,
+                backend: GpuBackend::Metal,
+            }),
+            storage: vec![],
+            cpu: CpuProfile {
+                model_name: "Apple M4 Pro".into(),
+                cores_performance: 10,
+                cores_efficiency: 4,
+                has_amx: true,
+                has_neon: true,
+                has_avx512: false,
+                has_avx2: false,
+                int8_gflops: 1000.0,
+            },
+        };
+
+        // 26B Gemma-class metadata where unquantized 32k FP16 KV would be ~6.44 GiB
+        let meta = ModelMetadata {
+            architecture: "gemma4".into(),
+            parameter_count: 26_000_000_000,
+            context_length: 131072,
+            embedding_dim: 4096,
+            num_layers: 42,
+            num_heads: 32,
+            num_kv_heads: 16,
+            vocab_size: 262144,
+            quantization: Some("Q4_K_M".into()),
+            is_moe: false,
+            num_experts: None,
+            num_experts_used: None,
+        };
+
+        let budget_32k = compute_gpu_budget(&hw, &meta, 32768);
+        // Raw FP16 KV at 32k here is 10.5 GiB, which previously crushed GPU budget down to ~2.4 GiB.
+        // With Q4_0 KV scaling (0.28x -> ~2.94 GiB), GPU budget stays above 9.5 GiB on 24 GB M4 Pro.
+        assert!(
+            budget_32k > (95 * (1 << 30)) / 10,
+            "Expected > 9.5 GiB GPU budget at 32k context with Q4_0 KV, got {} bytes",
+            budget_32k
+        );
     }
 }
