@@ -416,6 +416,41 @@ impl LlamaContext {
         Ok(())
     }
 
+    /// Returns the total serialized size (in bytes) of this context's state.
+    pub fn state_size(&self) -> usize {
+        unsafe { hypura_sys::llama_state_get_size(self.ptr) }
+    }
+
+    /// Serializes the entire context state (KV cache and recurrent hidden states)
+    /// into an in-memory buffer.
+    pub fn save_state_to_memory(&self) -> anyhow::Result<Vec<u8>> {
+        let size = self.state_size();
+        if size == 0 {
+            anyhow::bail!("Failed to determine context state size");
+        }
+        let mut buf = vec![0u8; size];
+        let copied = unsafe {
+            hypura_sys::llama_state_get_data(self.ptr, buf.as_mut_ptr(), size)
+        };
+        if copied == 0 {
+            anyhow::bail!("Failed to copy context state to memory buffer");
+        }
+        buf.truncate(copied);
+        Ok(buf)
+    }
+
+    /// Deserializes and restores context state (KV cache and recurrent hidden states)
+    /// from an in-memory buffer.
+    pub fn load_state_from_memory(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        let read = unsafe {
+            hypura_sys::llama_state_set_data(self.ptr, data.as_ptr(), data.len())
+        };
+        if read == 0 {
+            anyhow::bail!("Failed to restore context state from memory buffer");
+        }
+        Ok(())
+    }
+
     pub fn as_ptr(&self) -> *mut hypura_sys::llama_context {
         self.ptr
     }

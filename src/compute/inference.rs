@@ -56,11 +56,19 @@ pub struct GenerationResult {
     pub perf: PerfData,
 }
 
+/// In-memory serialized state checkpoint of a completed prompt prefill or turn boundary.
+#[derive(Clone)]
+struct StateCheckpoint {
+    tokens: Vec<i32>,
+    state_bytes: Arc<Vec<u8>>,
+}
+
 /// Persistent inference context & token history cached across HTTP requests for prefix KV reuse.
 struct CachedSession {
     ctx: LlamaContext,
     n_ctx: u32,
     tokens: Vec<i32>,
+    checkpoints: Vec<StateCheckpoint>,
 }
 
 /// A loaded model that can serve multiple generation requests.
@@ -934,6 +942,7 @@ pub fn generate_from_loaded(
             ctx,
             n_ctx: alloc_ctx,
             tokens: Vec::new(),
+            checkpoints: Vec::new(),
         });
     }
 
@@ -965,7 +974,7 @@ pub fn generate_from_loaded(
 
     // Reuse longest valid common token prefix already present in KV memory,
     // leaving at least 1 token to decode so logits are freshly computed for sampling.
-    let reused_len = {
+    let mut reused_len = {
         let session = loaded.cached_session.as_mut().unwrap();
         let common_len = session
             .tokens
@@ -978,6 +987,49 @@ pub fn generate_from_loaded(
         session.tokens.truncate(kept);
         kept
     };
+
+    // If live KV memory could not be partially rolled back (common on hybrid SSM / recurrent
+    // architectures like Qwen 3.5/3.8 or Gemma 4, where `llama_memory_recurrent` rejects `seq_rm`),
+    // check if a saved checkpoint matches an exact prefix of `eval_tokens`.
+    if reused_len == 0 {
+        let session = loaded.cached_session.as_mut().unwrap();
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in session.checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_tokens.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        if let Some(idx) = best_idx {
+            let cp = session.checkpoints[idx].clone();
+            session.ctx.clear_memory();
+            match session.ctx.load_state_from_memory(&cp.state_bytes) {
+                Ok(()) => {
+                    session.tokens = cp.tokens.clone();
+                    reused_len = best_len;
+                    tracing::info!(
+                        "Restored sequence state checkpoint #{}/{} (reused {}/{} prefix tokens in <1ms without re-prefill)",
+                        idx + 1,
+                        session.checkpoints.len(),
+                        reused_len,
+                        eval_tokens.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to restore sequence state checkpoint: {e}; clearing context");
+                    session.ctx.clear_memory();
+                    session.tokens.clear();
+                }
+            }
+        }
+    }
 
     let tokens_to_decode = eval_tokens.len().saturating_sub(reused_len);
     let session_n_ctx = loaded.cached_session.as_ref().map(|s| s.n_ctx).unwrap_or(effective_ctx);
@@ -1026,6 +1078,33 @@ pub fn generate_from_loaded(
         }
     }
 
+    // Snapshot the evaluated prompt state so subsequent conversational turns
+    // can restore this exact prefix state without re-prefilling from token 0.
+    if prefill_err.is_none() && tokens_to_decode > 0 {
+        let session = loaded.cached_session.as_mut().unwrap();
+        match session.ctx.save_state_to_memory() {
+            Ok(bytes) => {
+                let snap = StateCheckpoint {
+                    tokens: eval_tokens.to_vec(),
+                    state_bytes: Arc::new(bytes),
+                };
+                // Bound checkpoint cache to 4 turns to conserve memory
+                if session.checkpoints.len() >= 4 {
+                    session.checkpoints.remove(0);
+                }
+                session.checkpoints.push(snap);
+                tracing::debug!(
+                    "Saved state checkpoint for {} tokens ({} checkpoints in cache)",
+                    eval_tokens.len(),
+                    session.checkpoints.len()
+                );
+            }
+            Err(e) => {
+                tracing::debug!("Could not save state checkpoint: {e}");
+            }
+        }
+    }
+
     if let Some(first_err) = prefill_err {
         // Destroy poisoned LlamaContext immediately (`ggml-metal` latches `ctx->has_error = true`
         // after any command buffer failure and requires recreating the backend to recover).
@@ -1049,6 +1128,7 @@ pub fn generate_from_loaded(
                 ctx: retry_ctx,
                 n_ctx: effective_ctx,
                 tokens: Vec::new(),
+                checkpoints: Vec::new(),
             });
             let session = loaded.cached_session.as_mut().unwrap();
             for chunk in eval_tokens.chunks(fallback_batch as usize) {
@@ -2509,5 +2589,76 @@ mod tests {
                 override_regex: "^(output\\.weight)$".into(),
             }
         );
+    }
+
+    #[test]
+    fn test_checkpoint_prefix_matching() {
+        let checkpoints = vec![
+            StateCheckpoint {
+                tokens: vec![101, 102, 103, 104],
+                state_bytes: Arc::new(vec![1, 2, 3]),
+            },
+            StateCheckpoint {
+                tokens: vec![101, 102, 103, 104, 201, 202, 203],
+                state_bytes: Arc::new(vec![4, 5, 6]),
+            },
+        ];
+
+        // Case 1: Prompt is an extension of Turn 2 -> matches Turn 2 checkpoint (len=7)
+        let eval_turn3 = vec![101, 102, 103, 104, 201, 202, 203, 301, 302];
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_turn3.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_turn3.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        assert_eq!(best_idx, Some(1));
+        assert_eq!(best_len, 7);
+
+        // Case 2: Prompt branches off Turn 1 -> matches Turn 1 checkpoint (len=4)
+        let eval_branch = vec![101, 102, 103, 104, 999, 1000];
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_branch.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_branch.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        assert_eq!(best_idx, Some(0));
+        assert_eq!(best_len, 4);
+
+        // Case 3: Prompt completely differs -> no checkpoint matches (reused_len = 0)
+        let eval_different = vec![555, 666, 777];
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_different.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_different.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        assert_eq!(best_idx, None);
+        assert_eq!(best_len, 0);
     }
 }

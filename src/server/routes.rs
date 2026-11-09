@@ -247,6 +247,7 @@ async fn chat_handler(
     let telemetry = state.telemetry.clone();
     let req_messages = req.messages;
     let req_tools = req.tools;
+    let is_streaming = req.stream;
     let arch = info.architecture.clone();
     let model_req_name = req.model.clone();
     let active_model_name = model_name.clone();
@@ -260,6 +261,14 @@ async fn chat_handler(
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&req_messages, req_tools.as_ref(), Some(&full_hint));
+        if !is_streaming && prompt.len() > 12000 {
+            let estimated_tokens = prompt.len() / 4;
+            tracing::warn!(
+                "Non-streaming request received with large prompt (~{} tokens, {} chars); prefill may take 60-120s. Ensure client socket read timeout is >= 300s.",
+                estimated_tokens,
+                prompt.len()
+            );
+        }
         if prompt.ends_with("<think>\n") {
             let _ = token_tx.send(crate::compute::inference::GeneratedToken {
                 text: "<think>\n".into(),
@@ -561,6 +570,7 @@ async fn v1_chat_completions_handler(
         .and_then(|v| v.as_str())
         .map_or(false, |s| s.eq_ignore_ascii_case("none"));
     let req_tools = if tools_disabled { None } else { req.tools };
+    let is_streaming = req.stream;
     let arch = info.architecture.clone();
     let model_req_name = req.model.clone();
     let active_model_name = model_name.clone();
@@ -574,6 +584,14 @@ async fn v1_chat_completions_handler(
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&internal_messages, req_tools.as_ref(), Some(&full_hint));
+        if !is_streaming && prompt.len() > 12000 {
+            let estimated_tokens = prompt.len() / 4;
+            tracing::warn!(
+                "Non-streaming request received with large prompt (~{} tokens, {} chars); prefill may take 60-120s. Ensure client socket read timeout is >= 300s.",
+                estimated_tokens,
+                prompt.len()
+            );
+        }
         if prompt.ends_with("<think>\n") {
             let _ = token_tx.send(crate::compute::inference::GeneratedToken {
                 text: "<think>\n".into(),

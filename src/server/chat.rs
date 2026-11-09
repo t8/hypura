@@ -344,6 +344,20 @@ fn format_qwen_chat_prompt(
         let system_msg = messages.iter().find(|m| m.role == "system");
         let base_system = system_msg.map(|m| m.content.trim()).filter(|s| !s.is_empty());
 
+        let explicit_think = messages
+            .iter()
+            .any(|m| (m.role == "user" || m.role == "system") && m.content.contains("/think"));
+        let is_dense_heavy_tool_turn = tools_slice.is_some()
+            && !explicit_think
+            && !hint_lower.contains("moe")
+            && (hint_lower.contains("27b") || hint_lower.contains("32b"));
+        let no_think = messages
+            .iter()
+            .any(|m| (m.role == "user" || m.role == "system") && m.content.contains("/no_think"))
+            || is_dense_heavy_tool_turn;
+        let is_coder_non_thinking = (hint_lower.contains("qwen3-coder") || hint_lower.contains("qwen3_coder"))
+            && !hint_lower.contains("<think>");
+
         if let Some(arr) = tools_slice {
             prompt.push_str("<|im_start|>system\n");
             prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
@@ -396,11 +410,13 @@ fn format_qwen_chat_prompt(
                 let cleaned_trimmed = cleaned.trim();
                 if !cleaned_trimmed.is_empty() {
                     prompt.push_str(cleaned_trimmed);
+                } else if is_dense_heavy_tool_turn && msg.tool_calls.is_some() {
+                    prompt.push_str("<think>\n\n</think>\n\n");
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for (tc_i, tc) in tool_calls.iter().enumerate() {
                         if tc_i == 0 {
-                            if !cleaned_trimmed.is_empty() {
+                            if !cleaned_trimmed.is_empty() || (is_dense_heavy_tool_turn && cleaned_trimmed.is_empty()) {
                                 prompt.push_str("\n\n");
                             }
                         } else {
@@ -417,20 +433,6 @@ fn format_qwen_chat_prompt(
             prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content.trim()));
             i += 1;
         }
-
-        let explicit_think = messages
-            .iter()
-            .any(|m| (m.role == "user" || m.role == "system") && m.content.contains("/think"));
-        let is_dense_heavy_tool_turn = tools_slice.is_some()
-            && !explicit_think
-            && !hint_lower.contains("moe")
-            && (hint_lower.contains("27b") || hint_lower.contains("32b"));
-        let no_think = messages
-            .iter()
-            .any(|m| (m.role == "user" || m.role == "system") && m.content.contains("/no_think"))
-            || is_dense_heavy_tool_turn;
-        let is_coder_non_thinking = (hint_lower.contains("qwen3-coder") || hint_lower.contains("qwen3_coder"))
-            && !hint_lower.contains("<think>");
 
         prompt.push_str("<|im_start|>assistant\n");
         if !is_coder_non_thinking {
