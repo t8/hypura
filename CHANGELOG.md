@@ -42,6 +42,12 @@ All notable changes to the **Hypura** project are documented in this file.
 * **Eliminated 400+ CPU↔Metal Graph Splits (`op_offload = false`, `n_ubatch = 256`)**: Disabled `op_offload` and capped `n_ubatch` on partially offloaded models so CPU layers run cleanly on Apple Accelerate/AMX without staging gigabytes of CPU weights through Metal command buffers during prefill.
 * **Complete Gated Delta Net / SSM Hybrid Headroom (`qwen35`, `qwen3next`, `nemotron_h`) & Metal Error Recovery**: Added missing hybrid architectures to `is_ssm_hybrid`, pre-allocated `CachedSession` up to `min(n_ctx, 32768)` on Turn 1 to avoid mid-session context teardowns, and immediately dropped/recreated poisoned `LlamaContext` instances (`ctx->has_error`) with an automatic `batch=128` retry on GPU OOM (`code -3`).
 
+#### 8. Multi-Turn Sequence State Checkpointing & Hybrid SSM Prompt Prefix Reuse (`src/compute/inference.rs`, `src/compute/ffi.rs`, `src/server/chat.rs`, `src/server/routes.rs`)
+* **Prompt State Checkpointing**: Added `save_state_to_memory` and `load_state_from_memory` in `LlamaContext` wrapping `llama_state_get_size`, `llama_state_get_data`, and `llama_state_set_data` to checkpoint evaluated sequence states in memory after prefill.
+* **Hybrid SSM Zero-Prefill Recovery**: On hybrid recurrent models (Qwen 3.5/3.8 Gated Delta Net, Gemma 4) where `llama_memory_recurrent` rejects `seq_rm` for suffix deletion, automatically restores matching prefix state checkpoints from `CachedSession.checkpoints` in $<1\text{ms}$ instead of wiping memory and re-evaluating thousands of prompt tokens from token 0.
+* **Chat Prompt Prefix Stability**: Maintained consistent `<think>` formatting in `format_qwen_chat_prompt` across turns so multi-turn assistant messages match prompt history exactly without token divergence.
+* **Non-Streaming Prefill Duration Warning**: Logged early ETA warnings when non-streaming requests with large prompts ($>12,000$ characters) arrive to advise operators on appropriate client socket timeouts ($\ge 300\text{s}$).
+
 ---
 
 ## [0.2.5] - 2026-10-06
