@@ -245,7 +245,7 @@ pub struct LlamaContext {
 impl LlamaContext {
     /// Create a new inference context from a loaded model.
     pub fn new(model: &LlamaModel, n_ctx: u32, n_batch: u32, n_threads: i32) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, None, std::ptr::null_mut(), None)
+        Self::new_inner(model, n_ctx, n_batch, n_batch, n_threads, None, std::ptr::null_mut(), None, true)
     }
 
     /// Create a context with a cb_eval callback for layer tracking.
@@ -258,7 +258,7 @@ impl LlamaContext {
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, None)
+        Self::new_inner(model, n_ctx, n_batch, n_batch, n_threads, cb_eval, callback_data, None, false)
     }
 
     /// Create a context with callback and KV cache quantization.
@@ -271,27 +271,70 @@ impl LlamaContext {
         callback_data: *mut std::ffi::c_void,
         kv_quant: Option<crate::scheduler::types::KvQuantization>,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, kv_quant)
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_batch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            kv_quant,
+            cb_eval.is_none(),
+        )
     }
 
-    fn new_inner(
+    /// Create a context with explicit `n_ubatch` and `op_offload` control.
+    /// Disabling `op_offload` and capping `n_ubatch` on partially GPU-offloaded models
+    /// avoids hundreds of CPU<->Metal graph splits and prevents staging CPU weights into
+    /// Metal command buffers under tight unified memory pressure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
         model: &LlamaModel,
         n_ctx: u32,
         n_batch: u32,
+        n_ubatch: u32,
         n_threads: i32,
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
         kv_quant: Option<crate::scheduler::types::KvQuantization>,
+        op_offload: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_ubatch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            kv_quant,
+            op_offload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_ubatch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+        kv_quant: Option<crate::scheduler::types::KvQuantization>,
+        op_offload: bool,
     ) -> anyhow::Result<Self> {
         use crate::scheduler::types::KvQuantization;
 
         let mut params = unsafe { hypura_sys::llama_context_default_params() };
         params.n_ctx = n_ctx;
         params.n_batch = n_batch;
-        params.n_ubatch = n_batch;
+        params.n_ubatch = n_ubatch.min(n_batch).max(1);
         params.n_threads = n_threads;
         params.n_threads_batch = n_threads;
         params.offload_kqv = true;
+        params.op_offload = op_offload;
 
         if let Some(kv) = kv_quant {
             let ggml_type = match kv {
@@ -377,11 +420,11 @@ impl LlamaContext {
         self.ptr
     }
 
-    /// Clear all KV / recurrent sequence metadata so decoding starts fresh from position 0.
+    /// Clear all KV / recurrent sequence metadata and buffers so decoding starts fresh from position 0.
     pub fn clear_memory(&mut self) {
         let mem = unsafe { hypura_sys::llama_get_memory(self.ptr) };
         if !mem.is_null() {
-            unsafe { hypura_sys::llama_memory_clear(mem, false) };
+            unsafe { hypura_sys::llama_memory_clear(mem, true) };
         }
     }
 

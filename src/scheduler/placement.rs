@@ -150,20 +150,27 @@ fn compute_tier_capacities(
     } else {
         1.0 // F16
     };
-    let kv_headroom = (raw_kv as f64 * kv_scale) as u64;
-    let metal_safe_limit = gpu_max.min(usable);
-
     let arch_lower = metadata.architecture.to_lowercase();
-    let is_ssm_hybrid = arch_lower.contains("gemma")
+    let is_linear_attn_hybrid = arch_lower.contains("qwen35")
+        || arch_lower.contains("qwen3next")
+        || arch_lower.contains("nemotron_h")
+        || arch_lower.contains("falcon-h1")
+        || arch_lower.contains("granitehybrid")
+        || arch_lower.contains("plamo2")
         || arch_lower.contains("delta")
         || arch_lower.contains("mamba")
         || arch_lower.contains("rwkv")
         || arch_lower.contains("jamba");
 
-    let gpu_overhead = if is_ssm_hybrid {
-        5800 * 1024 * 1024
-    } else if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
-        4800 * 1024 * 1024
+    let kv_headroom = if is_linear_attn_hybrid {
+        ((raw_kv as f64 * kv_scale * 0.28) as u64) + 160 * 1024 * 1024
+    } else {
+        (raw_kv as f64 * kv_scale) as u64
+    };
+    let metal_safe_limit = gpu_max.min(usable);
+
+    let gpu_overhead = if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
+        3600 * 1024 * 1024
     } else {
         GPU_RUNTIME_OVERHEAD
     };

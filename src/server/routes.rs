@@ -216,6 +216,16 @@ async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> Response {
     let request_start = Instant::now();
+    tracing::info!(
+        "POST /api/chat: model={:?}, stream={}, messages={}, tools={}",
+        req.model,
+        req.stream,
+        req.messages.len(),
+        req.tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .map_or(0, |a| a.len())
+    );
 
     let (loaded, model_name, info) = {
         let mut manager = state.manager.lock().unwrap();
@@ -250,6 +260,14 @@ async fn chat_handler(
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&req_messages, req_tools.as_ref(), Some(&full_hint));
+        if prompt.ends_with("<think>\n") {
+            let _ = token_tx.send(crate::compute::inference::GeneratedToken {
+                text: "<think>\n".into(),
+                token_id: 0,
+                tok_per_sec: 0.0,
+                is_eog: false,
+            });
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -377,6 +395,7 @@ async fn collect_chat(
             role: "assistant".into(),
             content,
             tool_calls,
+            ..Default::default()
         },
         done: true,
         done_reason: Some("stop".into()),
@@ -442,6 +461,17 @@ async fn v1_chat_completions_handler(
     Json(req): Json<OpenAIChatCompletionRequest>,
 ) -> Response {
     let _request_start = Instant::now();
+    tracing::info!(
+        "POST /v1/chat/completions: model={:?}, stream={}, messages={}, tools={}, max_tokens={:?}",
+        req.model,
+        req.stream,
+        req.messages.len(),
+        req.tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .map_or(0, |a| a.len()),
+        req.max_tokens
+    );
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -488,16 +518,15 @@ async fn v1_chat_completions_handler(
         sampling.repeat_penalty = rp;
     }
 
-    // Convert OpenAIChatMessage to internal ChatMessage
-    let internal_messages: Vec<ChatMessage> = req
-        .messages
-        .into_iter()
-        .map(|m| ChatMessage {
-            role: m.role,
-            content: m.content.unwrap_or_default(),
-            tool_calls: m.tool_calls.map(|tcs| {
-                tcs.into_iter()
-                    .map(|tc| ToolCall {
+    // Convert OpenAIChatMessage to internal ChatMessage while resolving tool_call_id -> function name
+    let mut id_to_tool_name = std::collections::HashMap::<String, String>::new();
+    let mut internal_messages = Vec::with_capacity(req.messages.len());
+    for m in req.messages {
+        let converted_calls = m.tool_calls.map(|tcs| {
+            tcs.into_iter()
+                .map(|tc| {
+                    id_to_tool_name.insert(tc.id.clone(), tc.function.name.clone());
+                    ToolCall {
                         id: Some(tc.id),
                         call_type: Some(tc.call_type),
                         function: FunctionCall {
@@ -505,16 +534,33 @@ async fn v1_chat_completions_handler(
                             arguments: serde_json::from_str(&tc.function.arguments)
                                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments)),
                         },
-                    })
-                    .collect()
-            }),
-        })
-        .collect();
+                    }
+                })
+                .collect()
+        });
+        let resolved_tool_name = m.name.or_else(|| {
+            m.tool_call_id
+                .as_ref()
+                .and_then(|cid| id_to_tool_name.get(cid).cloned())
+        });
+        internal_messages.push(ChatMessage {
+            role: m.role,
+            content: m.content.unwrap_or_default(),
+            tool_calls: converted_calls,
+            tool_call_id: m.tool_call_id,
+            tool_name: resolved_tool_name,
+        });
+    }
 
     let (token_tx, token_rx) = mpsc::unbounded_channel();
     let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
     let telemetry = state.telemetry.clone();
-    let req_tools = req.tools;
+    let tools_disabled = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| s.eq_ignore_ascii_case("none"));
+    let req_tools = if tools_disabled { None } else { req.tools };
     let arch = info.architecture.clone();
     let model_req_name = req.model.clone();
     let active_model_name = model_name.clone();
@@ -528,6 +574,14 @@ async fn v1_chat_completions_handler(
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&internal_messages, req_tools.as_ref(), Some(&full_hint));
+        if prompt.ends_with("<think>\n") {
+            let _ = token_tx.send(crate::compute::inference::GeneratedToken {
+                text: "<think>\n".into(),
+                token_id: 0,
+                tok_per_sec: 0.0,
+                is_eog: false,
+            });
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -573,19 +627,30 @@ async fn v1_chat_completions_handler(
         let result = result_rx.await.ok();
         let (content, tool_calls) = crate::server::chat::parse_tool_calls(&full_response);
 
-        let openai_tool_calls = tool_calls.map(|tcs| {
+        let openai_tool_calls: Option<Vec<OpenAIToolCall>> = tool_calls.map(|tcs| {
             tcs.into_iter()
-                .enumerate()
-                .map(|(i, tc)| OpenAIToolCall {
-                    id: tc.id.unwrap_or_else(|| format!("call_{}_{}", chat_id, i)),
+                .map(|tc| OpenAIToolCall {
+                    index: None,
+                    id: tc
+                        .id
+                        .unwrap_or_else(crate::server::chat::generate_tool_call_id),
                     call_type: "function".into(),
                     function: OpenAIFunctionCall {
                         name: tc.function.name,
-                        arguments: serde_json::to_string(&tc.function.arguments).unwrap_or_default(),
+                        arguments: serde_json::to_string(&tc.function.arguments)
+                            .unwrap_or_else(|_| "{}".into()),
                     },
                 })
                 .collect()
         });
+
+        let has_tool_calls = openai_tool_calls.is_some();
+        let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+        let message_content = if has_tool_calls && content.is_empty() {
+            None
+        } else {
+            Some(content)
+        };
 
         let prompt_tokens = result.as_ref().map(|r| r.prompt_tokens).unwrap_or(0);
         let completion_tokens = result.as_ref().map(|r| r.tokens_generated).unwrap_or(0);
@@ -599,11 +664,12 @@ async fn v1_chat_completions_handler(
                 index: 0,
                 message: OpenAIChatMessage {
                     role: "assistant".into(),
-                    content: Some(content),
+                    content: message_content,
+                    name: None,
                     tool_calls: openai_tool_calls,
                     tool_call_id: None,
                 },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(finish_reason.into()),
             }],
             usage: OpenAIUsage {
                 prompt_tokens,

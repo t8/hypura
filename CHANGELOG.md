@@ -4,6 +4,46 @@ All notable changes to the **Hypura** project are documented in this file.
 
 ---
 
+## [0.2.6] - 2026-11-08
+
+### 🐛 Bug Fixes & Agentic Coding Optimizations
+
+#### 1. Quantized KV Cache Scaling in Metal GPU Budget (`src/compute/inference.rs`, `src/scheduler/placement.rs`)
+* Fixed `compute_gpu_budget` subtracting unquantized FP16 KV memory at 16k–128k contexts instead of applying the auto-selected `Q4_0` ($0.28\times$ at $\ge 32\text{k}$ or $> 4\text{ GiB}$ raw KV) and `Q8_0` ($0.53\times$ at $\ge 16\text{k}$ or $> 500\text{ MiB}$ raw KV) multipliers.
+* Restores ~5–7.5 GiB of Metal GPU layer offload budget for 26B–30B models (e.g., Gemma 4 26B) on 24 GB / 32 GB Apple Silicon Macs at 32k+ default context.
+
+#### 2. Persistent Context & In-Memory Prompt Prefix KV Reuse (`src/compute/inference.rs`, `src/compute/ffi.rs`)
+* Added persistent `CachedSession` on `LoadedModel` to reuse `LlamaContext` and cached token prefixes across consecutive HTTP requests instead of rebuilding the context from token 0 on every turn.
+* Added `LlamaModel::n_swa`, `LlamaContext::clear_memory`, and `LlamaContext::trim_kv_to_prefix` with sliding-window attention (`n_swa`) and hybrid recurrent cache validation (`llama_memory_seq_rm` / `llama_memory_seq_pos_min`), cleanly falling back to full sequence reset when partial suffix removal is unsupported.
+* Dramatically accelerates multi-turn coding-agent workflows that resend 10k–25k system + tool-schema tokens on every request.
+
+#### 3. Streaming Keep-Alive Heartbeats & Proxy Anti-Buffering (`src/server/streaming.rs`, `src/server/routes.rs`)
+* Added 15-second SSE `: keep-alive` comments (`sse_openai_chat_stream`, `sse_openai_completion_stream`) and empty NDJSON delta heartbeats (`ndjson_chat_stream`, `ndjson_generate_stream`) throughout prompt prefill, `<|channel>thought` / `<think>` stripping, and buffered `tool_calls` generation.
+* Added `Cache-Control: no-cache`, `Connection: keep-alive`, and `X-Accel-Buffering: no` response headers across all streaming endpoints to prevent 120-second idle read timeouts over Tailscale Funnel, reverse proxies, and coding-agent HTTP clients.
+
+#### 4. Immediate Client Disconnect Cancellation (`src/server/streaming.rs`, `src/compute/inference.rs`, `src/server/routes.rs`)
+* Monitored `tx.closed()` inside all streaming tasks so dropped client connections immediately close the token channel even while thought or tool-call output is being buffered.
+* Added `token_tx.is_closed()` checks on acquiring the model mutex and before each 512-token `ctx.decode` prefill batch so cancelled requests abort within seconds and release `LoadedModel` for subsequent requests.
+
+#### 5. OpenAI `/v1/chat/completions` Tool-Call Wire Spec Compliance (`src/server/openai_types.rs`, `src/server/streaming.rs`, `src/server/routes.rs`)
+* Added required `"index"` field (`0, 1, ...`) to streamed `delta.tool_calls[]` items in `sse_openai_chat_stream` and separated the `delta.tool_calls` chunk (`finish_reason: null`) from the final `finish_reason: "tool_calls"` chunk so strict OpenAI SDKs and coding agents execute multi-turn tool loops reliably.
+* Fixed non-streaming `v1_chat_completions_handler` returning `finish_reason: "stop"` instead of `"tool_calls"` when `tool_calls` are present, set `message.content` to `null` on pure tool-call turns, added multi-part array `content` / string-or-array `stop` deserialization, and preserved `tool_call_id` → `tool_name` mapping across turns.
+* Replaced duplicated prefix buffering with unified `ChatStreamFilter` so `<think>`, `<|channel>thought`, `[THINK]`, ```` ```json ````, and mid-stream `<tool_call>` / `[TOOL_CALLS]` / `<TOOLCALL>` tags never leak into streamed `content` deltas.
+
+#### 6. Native Multi-Turn Tool Calling for Qwen 3.5/3.8, Gemma 4, Nemotron 30B & Mistral Small 3.x (`src/server/chat.rs`, `src/compute/inference.rs`)
+* **Qwen 3.5 / 3.8 & Qwen3-Coder**: Added native XML `<tool_call><function=...><parameter=...>...</parameter></function></tool_call>` prompt & multi-turn history formatting, grouped `<tool_response>` turns, and `<think>` prefill tracking.
+* **Gemma 4 (26B / 31B)**: Added native `<|turn>system\n<|think|>...<|tool>declaration:...<tool|><turn|>` declarations, open-turn `<|tool_response>response:...<tool_response|>` multi-turn grouping, and RFC-8259 JSON escaping for `<|"|>...<|"|>` string arguments containing quotes or code.
+* **NVIDIA Nemotron-3 30B & Nano v2**: Fixed `"nemo"` substring misrouting `"nemotron"` to Mistral `[INST]`; added dedicated ChatML XML `<function>` and `<TOOLCALL>[...]</TOOLCALL>` formatting and parsing.
+* **Mistral Small 3.1/3.2 (24B/26B) & Ministral 3**: Added `[SYSTEM_PROMPT]`, `[TOOL_CALLS]name[CALL_ID]id9[ARGS]{...}` (with 9-char alphanumeric call ID normalization), `[TOOL_RESULTS]id9[TOOL_CONTENT]...[/TOOL_RESULTS]`, and `[THINK]...[/THINK]` stripping/parsing.
+* **CoT-Safe Early Stop (`should_stop_early`)**: Prevented hypothetical `</function>` or `</tool_call>` mentions inside active `<think>`, `<|channel>thought`, or `[THINK]` reasoning blocks from prematurely terminating generation before the real tool call is emitted.
+
+#### 7. Metal Unified-Memory Residency & OOM Prevention on 27B–32B Partial GPU Offload (`src/compute/inference.rs`, `src/compute/ffi.rs`, `src/scheduler/placement.rs`)
+* **Prevented Whole-File `MTLResidencySet` Wiring (`select_partial_offload_strategy`)**: During partial GPU offload (e.g., 34/65 layers of Qwen 3.8 27B on a 24 GB Mac), `output_norm` / tied `token_embd` at offset `0` plus `blk.63` at the end of the GGUF previously caused `llama.cpp`'s `get_mapping_range` to wire the entire ~17.2 GiB GGUF into Metal GPU residency (`kIOGPUCommandBufferCallbackErrorOutOfMemory`). Overriding output head tensors onto the CPU buffer type (or disabling `mmap` when layers are interleaved) restricts Metal residency wiring strictly to the offloaded GPU slice (~8.3 GiB).
+* **Eliminated 400+ CPU↔Metal Graph Splits (`op_offload = false`, `n_ubatch = 256`)**: Disabled `op_offload` and capped `n_ubatch` on partially offloaded models so CPU layers run cleanly on Apple Accelerate/AMX without staging gigabytes of CPU weights through Metal command buffers during prefill.
+* **Complete Gated Delta Net / SSM Hybrid Headroom (`qwen35`, `qwen3next`, `nemotron_h`) & Metal Error Recovery**: Added missing hybrid architectures to `is_ssm_hybrid`, pre-allocated `CachedSession` up to `min(n_ctx, 32768)` on Turn 1 to avoid mid-session context teardowns, and immediately dropped/recreated poisoned `LlamaContext` instances (`ctx->has_error`) with an automatic `batch=128` retry on GPU OOM (`code -3`).
+
+---
+
 ## [0.2.5] - 2026-10-06
 
 ### ✨ Features & Enhancements
