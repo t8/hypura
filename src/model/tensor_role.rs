@@ -19,6 +19,11 @@ pub enum TensorRole {
     MoeFusedExperts,
     Norm,
     OutputHead,
+    /// Sparse N-gram / PLE (Pattern Language Embedding) table (e.g. Qwen 3.8 Flash Next 51B table).
+    /// Used purely for sparse point lookups, never dense matrix multiplication; always placed in RAM/NVMe.
+    NgramEmbedding,
+    /// Multi-Token Prediction (MTP) draft head weights for speculative decoding.
+    MultiTokenPrediction,
     Other(String),
 }
 
@@ -39,6 +44,13 @@ impl TensorRole {
     ///   - `blk.N.attn_norm.weight` → Norm
     ///   - `output.weight` → OutputHead
     pub fn from_name(name: &str) -> Self {
+        let name_lower = name.to_ascii_lowercase();
+        if name_lower.contains("ngram") || name_lower.contains("ple_") || name_lower.contains("n_gram") {
+            return Self::NgramEmbedding;
+        }
+        if name_lower.contains("mtp.") || name_lower.contains("mtp_") || name_lower.contains("multi_token") {
+            return Self::MultiTokenPrediction;
+        }
         if name.contains("token_embd") {
             return Self::Embedding;
         }
@@ -165,6 +177,24 @@ mod tests {
         assert_eq!(
             TensorRole::from_name("blk.0.ffn_down_exps.weight"),
             TensorRole::MoeFusedExperts
+        );
+        // N-gram / PLE sparse embedding tables (e.g. Qwen 3.8 Flash Next)
+        assert_eq!(
+            TensorRole::from_name("model.ngram_embeddings.weight"),
+            TensorRole::NgramEmbedding
+        );
+        assert_eq!(
+            TensorRole::from_name("token_embd.ple_embeddings"),
+            TensorRole::NgramEmbedding
+        );
+        // Multi-Token Prediction (MTP) draft heads
+        assert_eq!(
+            TensorRole::from_name("mtp.0.attn_q.weight"),
+            TensorRole::MultiTokenPrediction
+        );
+        assert_eq!(
+            TensorRole::from_name("model.multi_token.head.weight"),
+            TensorRole::MultiTokenPrediction
         );
     }
 }

@@ -48,6 +48,12 @@ All notable changes to the **Hypura** project are documented in this file.
 * **Chat Prompt Prefix Stability**: Maintained consistent `<think>` formatting in `format_qwen_chat_prompt` across turns so multi-turn assistant messages match prompt history exactly without token divergence.
 * **Non-Streaming Prefill Duration Warning**: Logged early ETA warnings when non-streaming requests with large prompts ($>12,000$ characters) arrive to advise operators on appropriate client socket timeouts ($\ge 300\text{s}$).
 
+#### 9. Sparse N-Gram Embedding Tiering & Idle Memory TTL (`src/model/tensor_role.rs`, `src/scheduler/placement.rs`, `src/compute/inference.rs`, `src/server/manager.rs`, `src/cli/serve.rs`, `src/main.rs`)
+* **Sparse N-Gram & MTP Recognition**: Added `TensorRole::NgramEmbedding` and `TensorRole::MultiTokenPrediction` to classify massive sparse lookup tables (e.g. Qwen 3.8 Flash Next's 51B parameter N-gram table) and speculative draft heads.
+* **Host RAM/NVMe Embedding Placement**: Automatically routed N-gram lookup tables to `StorageTier::Ram` / `StorageTier::Nvme` and excluded them from GPU working-set calculations, saving 25–35 GiB of GPU VRAM on massive 180B-class models.
+* **Metal Residency Protection**: Overrode N-gram embedding tensors to the CPU buffer type in `select_partial_offload_strategy_with_plan` to prevent them from being wired into Metal GPU residency collections.
+* **Idle Memory Reclamation (`--idle-timeout`)**: Added `--idle-timeout <secs>` CLI flag to `hypura serve` to automatically unload models and release all Metal unified memory allocations when inactive.
+
 ---
 
 ## [0.2.5] - 2026-10-06

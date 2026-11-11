@@ -80,6 +80,9 @@ enum Commands {
         /// Ollama models directory (default: ~/.ollama/models)
         #[arg(long)]
         ollama_models: Option<PathBuf>,
+        /// Idle timeout in seconds before unloading model to free unified memory (0 to disable)
+        #[arg(long, default_value = "0")]
+        idle_timeout: u64,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -156,6 +159,7 @@ fn main() -> anyhow::Result<()> {
             context,
             models_dir,
             ollama_models,
+            idle_timeout,
         } => cli::serve::run(
             model.as_deref(),
             &host,
@@ -163,6 +167,7 @@ fn main() -> anyhow::Result<()> {
             context,
             models_dir,
             ollama_models,
+            idle_timeout,
         ),
         Commands::Bench {
             model,

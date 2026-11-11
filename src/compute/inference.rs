@@ -251,6 +251,17 @@ pub fn select_partial_offload_strategy_with_plan(
         }
     }
 
+    // Ensure any sparse N-gram / PLE embedding tables (e.g. Qwen 3.8 Flash Next 51B table)
+    // are explicitly overridden onto the CPU buffer type so they are never wired into Metal GPU residency.
+    for t in &gguf.tensors {
+        let name_lower = t.name.to_ascii_lowercase();
+        if (name_lower.contains("ngram") || name_lower.contains("ple_") || name_lower.contains("n_gram"))
+            && !non_contiguous_names.contains(&t.name)
+        {
+            non_contiguous_names.push(t.name.clone());
+        }
+    }
+
     if non_contiguous_names.is_empty() {
         PartialOffloadStrategy::StandardMmap {
             all_layers_on_gpu: n_gpu_layers >= total_offloadable,

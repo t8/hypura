@@ -219,4 +219,40 @@ impl ModelManager {
 
         self.load_model_entry(&entry, context_size)
     }
+
+    /// Check if the active model has been idle for longer than `idle_timeout` and unload it if so.
+    /// Returns true if a model was unloaded.
+    pub fn maybe_unload_idle(&mut self, idle_timeout: std::time::Duration) -> bool {
+        if let Some(ref active) = self.active_model {
+            if active.last_used.elapsed() >= idle_timeout {
+                tracing::info!(
+                    "Active model '{}' has been idle for {:.1}s (timeout: {:.1}s); unloading to reclaim unified memory",
+                    active.name,
+                    active.last_used.elapsed().as_secs_f64(),
+                    idle_timeout.as_secs_f64()
+                );
+                self.active_model = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_maybe_unload_idle_timeout() {
+        let registry = ModelRegistry::new(None, None);
+        let mut manager = ModelManager {
+            registry,
+            active_model: None,
+            default_context: 2048,
+        };
+
+        // No model loaded -> returns false
+        assert!(!manager.maybe_unload_idle(std::time::Duration::from_secs(60)));
+    }
 }

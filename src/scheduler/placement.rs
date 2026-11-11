@@ -245,6 +245,7 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
             let bonus = match role {
                 TensorRole::Norm => 10.0,
                 TensorRole::Embedding | TensorRole::OutputHead => 5.0,
+                TensorRole::NgramEmbedding => 0.0001, // Sparse point lookup: always kept in RAM/NVMe
                 _ => 1.0,
             };
 
@@ -328,7 +329,7 @@ fn try_expert_streaming_assign(
 
     let non_expert_bytes: u64 = tensors
         .iter()
-        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts))
+        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts | TensorRole::NgramEmbedding))
         .map(|t| t.size_bytes)
         .sum();
     let expert_bytes: u64 = tensors
@@ -365,10 +366,10 @@ fn try_expert_streaming_assign(
     let mut assignments = HashMap::new();
     let mut gpu_remaining = caps.gpu_bytes;
 
-    // Assign non-expert tensors to GPU/RAM by score
+    // Assign non-expert tensors to GPU/RAM by score (excluding sparse N-gram embeddings)
     let mut non_experts: Vec<&ScoredTensor> = tensors
         .iter()
-        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts))
+        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts | TensorRole::NgramEmbedding))
         .collect();
     non_experts.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
@@ -379,6 +380,14 @@ fn try_expert_streaming_assign(
         } else {
             assignments.insert(t.name.clone(), StorageTier::Ram);
         }
+    }
+
+    // Sparse N-gram embedding tables (e.g. Qwen 3.8 Flash Next 51B table) stay in RAM/NVMe
+    for t in tensors
+        .iter()
+        .filter(|t| matches!(t.role, TensorRole::NgramEmbedding))
+    {
+        assignments.insert(t.name.clone(), StorageTier::Ram);
     }
 
     // All expert tensors to NVMe
@@ -418,7 +427,7 @@ fn try_dense_ffn_streaming_assign(
 
     let non_ffn_bytes: u64 = tensors
         .iter()
-        .filter(|t| !is_ffn(&t.role))
+        .filter(|t| !is_ffn(&t.role) && !matches!(t.role, TensorRole::NgramEmbedding))
         .map(|t| t.size_bytes)
         .sum();
     let ffn_bytes: u64 = tensors.iter().filter(|t| is_ffn(&t.role)).map(|t| t.size_bytes).sum();
@@ -453,7 +462,10 @@ fn try_dense_ffn_streaming_assign(
     let mut assignments = HashMap::new();
     let mut gpu_remaining = caps.gpu_bytes;
 
-    let mut non_ffn: Vec<&ScoredTensor> = tensors.iter().filter(|t| !is_ffn(&t.role)).collect();
+    let mut non_ffn: Vec<&ScoredTensor> = tensors
+        .iter()
+        .filter(|t| !is_ffn(&t.role) && !matches!(t.role, TensorRole::NgramEmbedding))
+        .collect();
     non_ffn.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
     for t in non_ffn {
@@ -463,6 +475,10 @@ fn try_dense_ffn_streaming_assign(
         } else {
             assignments.insert(t.name.clone(), StorageTier::Ram);
         }
+    }
+
+    for t in tensors.iter().filter(|t| matches!(t.role, TensorRole::NgramEmbedding)) {
+        assignments.insert(t.name.clone(), StorageTier::Ram);
     }
 
     for t in tensors.iter().filter(|t| is_ffn(&t.role)) {
@@ -509,7 +525,15 @@ fn greedy_assign(
     let mut unified_remaining = caps.unified_limit;
 
     for t in &non_layer_tensors {
-        if t.size_bytes <= gpu_remaining && t.size_bytes <= unified_remaining {
+        if matches!(t.role, TensorRole::NgramEmbedding) {
+            // N-gram embeddings are sparse lookup tables; keep them out of GPU VRAM
+            if t.size_bytes <= unified_remaining {
+                unified_remaining -= t.size_bytes;
+                assignments.insert(t.name.clone(), StorageTier::Ram);
+            } else {
+                assignments.insert(t.name.clone(), StorageTier::Nvme);
+            }
+        } else if t.size_bytes <= gpu_remaining && t.size_bytes <= unified_remaining {
             gpu_remaining -= t.size_bytes;
             unified_remaining -= t.size_bytes;
             assignments.insert(t.name.clone(), StorageTier::Gpu);
@@ -1225,6 +1249,77 @@ mod tests {
         let plan_64k = compute_kv_cache_plan(&meta, 65536, &assignments, &caps);
         assert_eq!(plan_64k.kv_quantization, Some(KvQuantization::Q4_0));
         assert!(plan_64k.hot_window_tokens > 0);
+    }
+
+    #[test]
+    fn test_ngram_embedding_placement() {
+        let meta = make_metadata(32);
+        let caps = TierCapacities {
+            gpu_bytes: 8 * (1 << 30),
+            ram_bytes: 16 * (1 << 30),
+            unified_limit: 20 * (1 << 30),
+            nvme_peak_bw: 5_000_000_000,
+        };
+        let hw = HardwareProfile {
+            timestamp: chrono::Utc::now(),
+            system: crate::profiler::types::SystemInfo {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                machine_model: "Mac16,7".into(),
+                total_cores: 14,
+            },
+            memory: crate::profiler::types::MemoryProfile {
+                total_bytes: 24 * (1 << 30),
+                available_bytes: 18 * (1 << 30),
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                is_unified: true,
+            },
+            gpu: Some(crate::profiler::types::GpuProfile {
+                name: "Apple M4 Pro".into(),
+                vram_bytes: 19069 * 1024 * 1024,
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                fp16_tflops: 20.0,
+                backend: crate::profiler::types::GpuBackend::Metal,
+            }),
+            storage: vec![],
+            cpu: crate::profiler::types::CpuProfile {
+                model_name: "Apple M4 Pro".into(),
+                cores_performance: 10,
+                cores_efficiency: 4,
+                has_amx: true,
+                has_neon: true,
+                has_avx512: false,
+                has_avx2: false,
+                int8_gflops: 1000.0,
+            },
+        };
+
+        let tensors = vec![
+            TensorInfo {
+                name: "model.ngram_embeddings.weight".into(),
+                dimensions: vec![5120, 248320],
+                dtype: GgmlType::Q4K,
+                offset: 0,
+                size_bytes: 10 * (1 << 30), // 10 GB N-gram table
+                layer_index: None,
+            },
+            TensorInfo {
+                name: "token_embd.weight".into(),
+                dimensions: vec![5120, 248320],
+                dtype: GgmlType::Q4K,
+                offset: 10 * (1 << 30),
+                size_bytes: 2 * (1 << 30),
+                layer_index: None,
+            },
+        ];
+
+        let scored = score_tensors(&tensors, &meta);
+        assert_eq!(scored[0].role, TensorRole::NgramEmbedding);
+        assert!(scored[0].score < scored[1].score);
+
+        let assignments = greedy_assign(&scored, &caps, &hw, &meta);
+        // N-gram embeddings must be scheduled to RAM, not GPU VRAM!
+        assert_eq!(assignments.get("model.ngram_embeddings.weight"), Some(&StorageTier::Ram));
     }
 }
 
