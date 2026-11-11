@@ -7,7 +7,6 @@ use crate::compute::inference::{
 };
 use crate::model::gguf::GgufFile;
 use crate::profiler;
-use crate::scheduler::placement::compute_placement_with_context_and_kv_quant;
 use crate::server::ollama_types::GgufInfo;
 use crate::server::registry::{ModelRegistry, RegisteredModel};
 

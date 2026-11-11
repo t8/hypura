@@ -227,6 +227,79 @@ impl LlamaModel {
         }
         String::from_utf8_lossy(&buf).to_string()
     }
+
+    /// Apply a chat template to a series of `(role, content)` message tuples using llama.cpp's
+    /// built-in template engine.
+    ///
+    /// If `custom_template` is `None`, uses the model's embedded template.
+    /// `add_assistant_prompt` controls whether to append the assistant turn header (e.g. `<|im_start|>assistant\n`).
+    pub fn apply_chat_template(
+        &self,
+        custom_template: Option<&str>,
+        messages: &[(&str, &str)],
+        add_assistant_prompt: bool,
+    ) -> Option<String> {
+        let custom_c = custom_template.and_then(|t| std::ffi::CString::new(t).ok());
+        let tmpl_ptr = if let Some(ref c) = custom_c {
+            c.as_ptr()
+        } else {
+            unsafe { hypura_sys::llama_model_chat_template(self.ptr, std::ptr::null()) }
+        };
+
+        if tmpl_ptr.is_null() {
+            return None;
+        }
+
+        let mut role_cstrings = Vec::with_capacity(messages.len());
+        let mut content_cstrings = Vec::with_capacity(messages.len());
+        let mut chat_msgs = Vec::with_capacity(messages.len());
+
+        for (role, content) in messages {
+            let r = std::ffi::CString::new(*role).ok()?;
+            let c = std::ffi::CString::new(*content).ok()?;
+            chat_msgs.push(hypura_sys::llama_chat_message {
+                role: r.as_ptr(),
+                content: c.as_ptr(),
+            });
+            role_cstrings.push(r);
+            content_cstrings.push(c);
+        }
+
+        // Measure formatted buffer size
+        let needed_size = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl_ptr,
+                chat_msgs.as_ptr(),
+                chat_msgs.len(),
+                add_assistant_prompt,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if needed_size < 0 {
+            return None;
+        }
+
+        let mut buf = vec![0u8; (needed_size as usize) + 1];
+        let res = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl_ptr,
+                chat_msgs.as_ptr(),
+                chat_msgs.len(),
+                add_assistant_prompt,
+                buf.as_mut_ptr() as *mut i8,
+                buf.len() as i32,
+            )
+        };
+
+        if res < 0 {
+            return None;
+        }
+
+        buf.truncate(res as usize);
+        String::from_utf8(buf).ok()
+    }
 }
 
 impl Drop for LlamaModel {
@@ -595,5 +668,45 @@ mod tests {
         assert!(p.temperature > 0.0);
         assert!(p.top_k > 0);
         assert!(p.max_tokens > 0);
+    }
+
+    #[test]
+    fn test_llama_chat_apply_template() {
+        let _backend = LlamaBackend::init();
+        let tmpl = std::ffi::CString::new("chatml").unwrap();
+        let r1 = std::ffi::CString::new("user").unwrap();
+        let c1 = std::ffi::CString::new("hello world").unwrap();
+        let msgs = [hypura_sys::llama_chat_message {
+            role: r1.as_ptr(),
+            content: c1.as_ptr(),
+        }];
+
+        let len = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                msgs.as_ptr(),
+                msgs.len(),
+                true,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(len > 0);
+        let mut buf = vec![0u8; (len + 1) as usize];
+        let res = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                msgs.as_ptr(),
+                msgs.len(),
+                true,
+                buf.as_mut_ptr() as *mut i8,
+                buf.len() as i32,
+            )
+        };
+        assert_eq!(res, len);
+        buf.truncate(res as usize);
+        let formatted = String::from_utf8(buf).unwrap();
+        assert!(formatted.contains("<|im_start|>user\nhello world<|im_end|>"));
+        assert!(formatted.contains("<|im_start|>assistant\n"));
     }
 }

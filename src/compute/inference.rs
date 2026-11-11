@@ -87,7 +87,7 @@ pub struct LoadedModel {
     // NVMe scheduling state (None when all tensors fit in GPU+RAM)
     _controller: Option<Box<HypuraBuftController>>,
     prefetch_state: Option<Arc<PrefetchState>>,
-    keep_resident: bool,
+    _keep_resident: bool,
 }
 
 /// Strategy for loading a non-NVMe model onto Metal + CPU without over-wiring unified memory.
@@ -387,7 +387,7 @@ pub fn load_model(
             kv_quantization: plan.kv_cache_plan.kv_quantization,
             _controller: None,
             prefetch_state: None,
-            keep_resident: false,
+            _keep_resident: false,
         });
     }
 
@@ -578,7 +578,7 @@ pub fn load_model(
         kv_quantization: plan.kv_cache_plan.kv_quantization,
         _controller: Some(controller),
         prefetch_state: Some(prefetch_state),
-        keep_resident,
+        _keep_resident: keep_resident,
     })
 }
 

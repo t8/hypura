@@ -65,6 +65,9 @@ enum Commands {
     Serve {
         /// Optional initial model to pre-load (dynamic on-demand if omitted)
         model: Option<String>,
+        /// Optional initial model name or path via flag
+        #[arg(short = 'm', long = "model")]
+        model_flag: Option<String>,
         /// Host to bind to
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -157,6 +160,7 @@ fn main() -> anyhow::Result<()> {
         } => cli::run::run(&model, context, prompt.as_deref(), interactive, max_tokens),
         Commands::Serve {
             model,
+            model_flag,
             host,
             port,
             context,
@@ -165,7 +169,7 @@ fn main() -> anyhow::Result<()> {
             idle_timeout,
             kv_quant,
         } => cli::serve::run(
-            model.as_deref(),
+            model.or(model_flag).as_deref(),
             &host,
             port,
             context,

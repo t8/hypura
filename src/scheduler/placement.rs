@@ -1045,6 +1045,7 @@ mod tests {
     use super::*;
     use crate::model::gguf::{GgmlType, TensorInfo};
 
+    #[allow(dead_code)]
     fn make_tensors(count: usize, size: u64) -> Vec<TensorInfo> {
         (0..count)
             .map(|i| TensorInfo {

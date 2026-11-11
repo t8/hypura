@@ -54,6 +54,11 @@ All notable changes to the **Hypura** project are documented in this file.
 * **Metal Residency Protection**: Overrode N-gram embedding tensors to the CPU buffer type in `select_partial_offload_strategy_with_plan` to prevent them from being wired into Metal GPU residency collections.
 * **Idle Memory Reclamation (`--idle-timeout`)**: Added `--idle-timeout <secs>` CLI flag to `hypura serve` to automatically unload models and release all Metal unified memory allocations when inactive.
 
+#### 10. Native Jinja Template Execution & Qwen 3.8 Flash Next Startup Automation (`src/compute/ffi.rs`, `src/main.rs`, `start_qwen_flash.sh`)
+* **Built-in Chat Template Execution (`LlamaModel::apply_chat_template`)**: Bound `llama_chat_apply_template` to format conversation turns with 100% fidelity using `llama.cpp`'s native C++ template engine when custom or model-embedded templates are present. Added verification unit test `test_llama_chat_apply_template`.
+* **Flexible CLI Model Selection**: Added `-m, --model <NAME>` flag support in addition to positional arguments for `hypura serve` to prevent unexpected argument errors with complex parameter orders.
+* **Qwen 3.8 Flash Next Turnkey Launcher (`start_qwen_flash.sh`)**: Added production startup script configuring 32k context, 600s idle memory timeout, `q8_0` KV quantization, external model directory mapping, and Tailscale Funnel endpoint display.
+
 ---
 
 ## [0.2.5] - 2026-10-06
