@@ -7,7 +7,7 @@ use crate::compute::inference::{
 };
 use crate::model::gguf::GgufFile;
 use crate::profiler;
-use crate::scheduler::placement::compute_placement_with_context;
+use crate::scheduler::placement::compute_placement_with_context_and_kv_quant;
 use crate::server::ollama_types::GgufInfo;
 use crate::server::registry::{ModelRegistry, RegisteredModel};
 
@@ -25,6 +25,7 @@ pub struct ModelManager {
     pub registry: ModelRegistry,
     pub active_model: Option<ActiveModel>,
     pub default_context: u32,
+    pub default_kv_quant: Option<crate::scheduler::types::KvQuantization>,
 }
 
 impl ModelManager {
@@ -32,11 +33,13 @@ impl ModelManager {
         registry: ModelRegistry,
         default_context: u32,
         initial_model_path: Option<&str>,
+        default_kv_quant: Option<crate::scheduler::types::KvQuantization>,
     ) -> anyhow::Result<Self> {
         let mut manager = Self {
             registry,
             active_model: None,
             default_context,
+            default_kv_quant,
         };
 
         if let Some(path_str) = initial_model_path {
@@ -163,7 +166,12 @@ impl ModelManager {
             }
         };
 
-        let plan = compute_placement_with_context(&gguf, &hardware, context_size)?;
+        let plan = crate::scheduler::placement::compute_placement_with_context_and_kv_quant(
+            &gguf,
+            &hardware,
+            context_size,
+            self.default_kv_quant,
+        )?;
         let gpu_budget = compute_gpu_budget(&hardware, &model_entry.metadata, context_size);
         let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
 
@@ -250,6 +258,7 @@ mod tests {
             registry,
             active_model: None,
             default_context: 2048,
+            default_kv_quant: None,
         };
 
         // No model loaded -> returns false

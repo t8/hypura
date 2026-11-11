@@ -83,6 +83,9 @@ enum Commands {
         /// Idle timeout in seconds before unloading model to free unified memory (0 to disable)
         #[arg(long, default_value = "0")]
         idle_timeout: u64,
+        /// KV cache quantization type: f16, q8_0, or q4_0 (auto-selected by context size if omitted)
+        #[arg(long)]
+        kv_quant: Option<String>,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -160,6 +163,7 @@ fn main() -> anyhow::Result<()> {
             models_dir,
             ollama_models,
             idle_timeout,
+            kv_quant,
         } => cli::serve::run(
             model.as_deref(),
             &host,
@@ -168,6 +172,7 @@ fn main() -> anyhow::Result<()> {
             models_dir,
             ollama_models,
             idle_timeout,
+            kv_quant,
         ),
         Commands::Bench {
             model,

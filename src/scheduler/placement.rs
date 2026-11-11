@@ -29,6 +29,16 @@ pub fn compute_placement_with_context(
     hardware: &HardwareProfile,
     context_length: u32,
 ) -> anyhow::Result<PlacementPlan> {
+    compute_placement_with_context_and_kv_quant(model, hardware, context_length, None)
+}
+
+/// Compute placement with a specific context length and optional KV cache quantization override.
+pub fn compute_placement_with_context_and_kv_quant(
+    model: &GgufFile,
+    hardware: &HardwareProfile,
+    context_length: u32,
+    kv_quant_override: Option<KvQuantization>,
+) -> anyhow::Result<PlacementPlan> {
     let metadata = ModelMetadata::from_gguf(model)?;
     let context_length = if context_length > 0 {
         context_length.min(metadata.context_length.max(2048))
@@ -78,7 +88,13 @@ pub fn compute_placement_with_context(
         build_prefetch_schedule(&tier_assignments, &model.tensors, &metadata, hardware);
 
     // KV cache plan
-    let kv_cache_plan = compute_kv_cache_plan(&metadata, context_length, &tier_assignments, &capacities);
+    let kv_cache_plan = compute_kv_cache_plan(
+        &metadata,
+        context_length,
+        &tier_assignments,
+        &capacities,
+        kv_quant_override,
+    );
 
     // Quick tok/s estimate for the plan
     let estimated_tok_per_sec = quick_estimate(
@@ -840,6 +856,7 @@ fn compute_kv_cache_plan(
     context_length: u32,
     _assignments: &HashMap<String, StorageTier>,
     caps: &TierCapacities,
+    kv_quant_override: Option<KvQuantization>,
 ) -> KvCachePlan {
     let kv_per_token_fp16 = estimate_kv_bytes(metadata, 1);
     if kv_per_token_fp16 == 0 {
@@ -856,22 +873,22 @@ fn compute_kv_cache_plan(
 
     let total_fp16_kv = kv_per_token_fp16 * context_length as u64;
 
-    // Auto-select KV quantization when GPU headroom is tight or context is massive:
-    // >= 32k tokens or FP16 KV > 4 GB -> Q4_0 (saves ~72% KV memory)
-    // >= 16k tokens or FP16 KV > 500 MB -> Q8_0 (saves ~47% KV memory)
-    let kv_quantization = if context_length >= 32768
-        || total_fp16_kv > (4u64 << 30)
-        || (caps.gpu_bytes < total_fp16_kv / 2 && context_length >= 16384)
-    {
-        Some(KvQuantization::Q4_0)
-    } else if context_length >= 16384
-        || total_fp16_kv > (500 * (1 << 20))
-        || caps.gpu_bytes < total_fp16_kv + (2 * (1 << 30))
-    {
-        Some(KvQuantization::Q8_0)
-    } else {
-        None
-    };
+    // Use explicit override if provided; otherwise auto-select based on context and headroom
+    let kv_quantization = kv_quant_override.or_else(|| {
+        if context_length >= 32768
+            || total_fp16_kv > (4u64 << 30)
+            || (caps.gpu_bytes < total_fp16_kv / 2 && context_length >= 16384)
+        {
+            Some(KvQuantization::Q4_0)
+        } else if context_length >= 16384
+            || total_fp16_kv > (500 * (1 << 20))
+            || caps.gpu_bytes < total_fp16_kv + (2 * (1 << 30))
+        {
+            Some(KvQuantization::Q8_0)
+        } else {
+            None
+        }
+    });
 
     let kv_per_token = match kv_quantization {
         Some(KvQuantization::Q4_0) => ((kv_per_token_fp16 as f64) * 0.28).ceil() as u64,
@@ -1242,13 +1259,17 @@ mod tests {
         let assignments = HashMap::new();
 
         // 8k context should stay Q8_0 or F16
-        let plan_8k = compute_kv_cache_plan(&meta, 8192, &assignments, &caps);
+        let plan_8k = compute_kv_cache_plan(&meta, 8192, &assignments, &caps, None);
         assert_ne!(plan_8k.kv_quantization, Some(KvQuantization::Q4_0));
 
         // 64k massive context should select Q4_0
-        let plan_64k = compute_kv_cache_plan(&meta, 65536, &assignments, &caps);
+        let plan_64k = compute_kv_cache_plan(&meta, 65536, &assignments, &caps, None);
         assert_eq!(plan_64k.kv_quantization, Some(KvQuantization::Q4_0));
         assert!(plan_64k.hot_window_tokens > 0);
+
+        // Explicit override: 2k context with forced Q4_0
+        let plan_override = compute_kv_cache_plan(&meta, 2048, &assignments, &caps, Some(KvQuantization::Q4_0));
+        assert_eq!(plan_override.kv_quantization, Some(KvQuantization::Q4_0));
     }
 
     #[test]
