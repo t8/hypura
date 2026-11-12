@@ -110,6 +110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusLabel: NSTextField?
     var toggleServerButton: NSButton?
 
+    // Log window UI
+    var logWindow: NSWindow?
+    var logTextView: NSTextView?
+    var logTimer: Timer?
+    var lastLogOffset: UInt64 = 0
+    var autoScrollCheckbox: NSButton?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // Menu bar agent app (no Dock icon)
 
@@ -278,7 +285,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(cliItem)
         }
 
-        let logsItem = NSMenuItem(title: "View Server Logs (/tmp/hypura.log)", action: #selector(viewLogsAction), keyEquivalent: "")
+        let logsItem = NSMenuItem(title: "Log Window...", action: #selector(openLogWindow), keyEquivalent: "l")
         logsItem.target = self
         menu.addItem(logsItem)
 
@@ -410,6 +417,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.kvQuantPopup = kvPopup
 
         // 7. Save & Restart Button
+        let logBtn = NSButton(title: "Log Window...", target: self, action: #selector(openLogWindow))
+        logBtn.frame = NSRect(x: 20, y: 15, width: 130, height: 32)
+        logBtn.bezelStyle = .rounded
+        contentView.addSubview(logBtn)
+
         let saveBtn = NSButton(title: "Save & Restart Server", target: self, action: #selector(saveSettingsAction))
         saveBtn.frame = NSRect(x: 270, y: 15, width: 190, height: 32)
         saveBtn.bezelStyle = .rounded
@@ -494,6 +506,184 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "OK")
         alert.runModal()
         buildMenu()
+    }
+
+    @objc func openLogWindow() {
+        if let window = logWindow {
+            refreshLogsFromDisk(initial: false)
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 800, height: 500),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Hypura Server Logs (Live Activity)"
+        window.minSize = NSSize(width: 550, height: 350)
+        window.center()
+        window.isReleasedWhenClosed = false
+
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+        contentView.autoresizingMask = [.width, .height]
+
+        // Top toolbar
+        let toolbar = NSView(frame: NSRect(x: 0, y: 458, width: 800, height: 42))
+        toolbar.autoresizingMask = [.width, .minYMargin]
+
+        let titleLabel = NSTextField(labelWithString: "Server Activity (stdout & stderr):")
+        titleLabel.frame = NSRect(x: 15, y: 12, width: 230, height: 18)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 12)
+        toolbar.addSubview(titleLabel)
+
+        let clearBtn = NSButton(title: "Clear", target: self, action: #selector(clearLogsAction))
+        clearBtn.frame = NSRect(x: 250, y: 7, width: 75, height: 26)
+        clearBtn.bezelStyle = .rounded
+        clearBtn.font = NSFont.systemFont(ofSize: 11)
+        toolbar.addSubview(clearBtn)
+
+        let copyBtn = NSButton(title: "Copy All", target: self, action: #selector(copyLogsAction))
+        copyBtn.frame = NSRect(x: 330, y: 7, width: 85, height: 26)
+        copyBtn.bezelStyle = .rounded
+        copyBtn.font = NSFont.systemFont(ofSize: 11)
+        toolbar.addSubview(copyBtn)
+
+        let autoScrollBtn = NSButton(checkboxWithTitle: "Auto-scroll", target: self, action: #selector(toggleAutoScroll))
+        autoScrollBtn.frame = NSRect(x: 425, y: 10, width: 100, height: 20)
+        autoScrollBtn.state = .on
+        autoScrollBtn.font = NSFont.systemFont(ofSize: 11)
+        toolbar.addSubview(autoScrollBtn)
+        self.autoScrollCheckbox = autoScrollBtn
+
+        let openFileBtn = NSButton(title: "Open in TextEdit...", target: self, action: #selector(viewLogsAction))
+        openFileBtn.frame = NSRect(x: 650, y: 7, width: 135, height: 26)
+        openFileBtn.bezelStyle = .rounded
+        openFileBtn.font = NSFont.systemFont(ofSize: 11)
+        openFileBtn.autoresizingMask = [.minXMargin]
+        toolbar.addSubview(openFileBtn)
+
+        let sep = NSBox(frame: NSRect(x: 0, y: 0, width: 800, height: 1))
+        sep.boxType = .separator
+        sep.autoresizingMask = [.width]
+        toolbar.addSubview(sep)
+
+        contentView.addSubview(toolbar)
+
+        // ScrollView and TextView
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 800, height: 458))
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.borderType = .noBorder
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 800, height: 458))
+        textView.autoresizingMask = [.width]
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.backgroundColor = NSColor(calibratedRed: 0.10, green: 0.11, blue: 0.13, alpha: 1.0)
+        textView.textColor = NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.88, alpha: 1.0)
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        textView.textContainerInset = NSSize(width: 10, height: 10)
+
+        scrollView.documentView = textView
+        contentView.addSubview(scrollView)
+
+        window.contentView = contentView
+        self.logWindow = window
+        self.logTextView = textView
+
+        refreshLogsFromDisk(initial: true)
+        startLogTimer()
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func refreshLogsFromDisk(initial: Bool = false) {
+        let path = "/tmp/hypura.log"
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: path) {
+            fm.createFile(atPath: path, contents: nil)
+        }
+
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let size = attrs[.size] as? UInt64 else {
+            return
+        }
+
+        if initial {
+            if let handle = FileHandle(forReadingAtPath: path) {
+                if size > 256 * 1024 {
+                    handle.seek(toFileOffset: size - 256 * 1024)
+                }
+                let data = handle.readDataToEndOfFile()
+                handle.closeFile()
+                if let str = String(data: data, encoding: .utf8) {
+                    logTextView?.string = str
+                    if autoScrollCheckbox?.state == .on {
+                        logTextView?.scrollToEndOfDocument(nil)
+                    }
+                }
+                lastLogOffset = size
+            }
+            return
+        }
+
+        if size > lastLogOffset {
+            if let handle = FileHandle(forReadingAtPath: path) {
+                handle.seek(toFileOffset: lastLogOffset)
+                let data = handle.readDataToEndOfFile()
+                handle.closeFile()
+                lastLogOffset = size
+                if let str = String(data: data, encoding: .utf8), !str.isEmpty {
+                    if let storage = logTextView?.textStorage {
+                        let attrStr = NSAttributedString(
+                            string: str,
+                            attributes: [
+                                .foregroundColor: NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.88, alpha: 1.0),
+                                .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+                            ]
+                        )
+                        storage.append(attrStr)
+                        if autoScrollCheckbox?.state == .on {
+                            logTextView?.scrollToEndOfDocument(nil)
+                        }
+                    }
+                }
+            }
+        } else if size < lastLogOffset {
+            lastLogOffset = 0
+            refreshLogsFromDisk(initial: true)
+        }
+    }
+
+    func startLogTimer() {
+        if logTimer != nil { return }
+        logTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshLogsFromDisk(initial: false)
+        }
+    }
+
+    @objc func clearLogsAction() {
+        let path = "/tmp/hypura.log"
+        try? "".write(toFile: path, atomically: true, encoding: .utf8)
+        lastLogOffset = 0
+        logTextView?.string = ""
+    }
+
+    @objc func copyLogsAction() {
+        let text = logTextView?.string ?? ""
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    @objc func toggleAutoScroll() {
+        if autoScrollCheckbox?.state == .on {
+            logTextView?.scrollToEndOfDocument(nil)
+        }
     }
 
     @objc func viewLogsAction() {
