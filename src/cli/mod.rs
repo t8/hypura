@@ -7,5 +7,7 @@ pub mod list;
 pub mod optimize;
 pub mod profile;
 pub mod ps;
+pub mod pull;
+pub mod rm;
 pub mod run;
 pub mod serve;

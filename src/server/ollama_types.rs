@@ -75,6 +75,37 @@ pub struct ShowRequest {
     pub model: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteRequest {
+    #[serde(alias = "model")]
+    pub name: String,
+    #[serde(default)]
+    pub models_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PullRequest {
+    #[serde(alias = "model")]
+    pub name: String,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    #[serde(default)]
+    pub models_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PullResponseChunk {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
+}
+
 // ── Response types ──
 
 #[derive(Debug, Serialize)]

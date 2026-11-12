@@ -157,3 +157,4 @@ exec "$HYPURA_BIN" serve \
   --idle-timeout "$IDLE_TIMEOUT" \
   --kv-quant "$KV_QUANT" \
   "${EXTRA_ARGS[@]}"
+

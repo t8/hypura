@@ -70,12 +70,31 @@ impl ModelRegistry {
         registry
     }
 
+    /// Set or override the custom models directory at runtime and refresh.
+    pub fn set_custom_dir(&mut self, dir: Option<PathBuf>) {
+        self.custom_dir = dir;
+        self.refresh();
+    }
+
     /// Refresh and scan all directories for models.
     pub fn refresh(&mut self) {
         self.models.clear();
 
-        // 1. Scan custom directory (if specified)
-        let custom_dir = self.custom_dir.clone();
+        // 1. Scan custom directory (if specified, or fallback to environment/default)
+        let custom_dir = self.custom_dir.clone().or_else(|| {
+            if let Ok(env_val) = std::env::var("HYPURA_MODELS_DIR") {
+                let p = PathBuf::from(env_val);
+                if p.is_dir() {
+                    return Some(p);
+                }
+            }
+            let realtek = PathBuf::from("/Volumes/RealtekData/models");
+            if realtek.is_dir() {
+                return Some(realtek);
+            }
+            None
+        });
+
         if let Some(ref dir) = custom_dir {
             self.scan_directory(dir, "Custom");
         }

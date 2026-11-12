@@ -46,6 +46,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/show", post(show_handler))
         .route("/api/generate", post(generate_handler))
         .route("/api/chat", post(chat_handler))
+        .route("/api/pull", post(pull_handler))
+        .route("/api/delete", axum::routing::delete(delete_handler))
         // OpenAI API (with /v1/ prefix and without /v1/ for clients with custom base_url handling)
         .route("/v1/models", get(v1_models_handler))
         .route("/models", get(v1_models_handler))
@@ -132,6 +134,128 @@ async fn show_handler(
             Json(serde_json::json!({"error": format!("model '{}' not found", req.model)})),
         )
             .into_response(),
+    }
+}
+
+async fn delete_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteRequest>,
+) -> Response {
+    let custom_dir_override = req.models_dir.map(std::path::PathBuf::from);
+    let mut manager = state.manager.lock().unwrap();
+
+    // If active model is being deleted, unload it first
+    if let Some(ref active) = manager.active_model {
+        if active.name.eq_ignore_ascii_case(&req.name)
+            || active.name.to_lowercase().contains(&req.name.to_lowercase())
+        {
+            manager.active_model = None;
+        }
+    }
+
+    let target_dir = custom_dir_override
+        .or_else(|| manager.registry.custom_dir.clone());
+
+    match crate::model::pull::delete_model_files(&req.name, target_dir.as_deref(), &mut manager.registry) {
+        Ok((name, bytes_freed)) => {
+            tracing::info!("Deleted model '{}' (freed {} bytes)", name, bytes_freed);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn pull_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PullRequest>,
+) -> Response {
+    let spec = match crate::model::pull::resolve_pull_spec(&req.name) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let target_models_dir = req
+        .models_dir
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let manager = state.manager.lock().unwrap();
+            manager.registry.custom_dir.clone()
+        })
+        .unwrap_or_else(crate::model::pull::detect_default_models_dir);
+
+    if !req.stream {
+        // Non-streaming: await completion
+        match crate::model::pull::download_model_with_progress(
+            &spec,
+            &target_models_dir,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {
+                let mut manager = state.manager.lock().unwrap();
+                manager.registry.refresh();
+                Json(serde_json::json!({"status": "success"})).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        // Streaming: NDJSON progress chunks
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let state_clone = state.clone();
+        let target_dir_clone = target_models_dir.clone();
+
+        tokio::spawn(async move {
+            let res = crate::model::pull::download_model_with_progress(
+                &spec,
+                &target_dir_clone,
+                false,
+                Some(tx.clone()),
+            )
+            .await;
+
+            if res.is_ok() {
+                let mut manager = state_clone.manager.lock().unwrap();
+                manager.registry.refresh();
+            } else if let Err(e) = res {
+                let _ = tx
+                    .send(crate::server::ollama_types::PullResponseChunk {
+                        status: format!("error: {e}"),
+                        digest: None,
+                        total: None,
+                        completed: None,
+                    })
+                    .await;
+            }
+        });
+
+        let body = streaming::ndjson_pull_stream(rx);
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (header::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
+            body,
+        )
+            .into_response()
     }
 }
 

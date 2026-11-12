@@ -25,6 +25,12 @@ All notable changes to the **Hypura** project are documented in this file.
 * Fixed case-insensitive model name matching in `get_or_load` so requests can match active models regardless of capitalization.
 * Increased default `IDLE_TIMEOUT` in `start_qwen_flash.sh` to 1800s (30 minutes).
 
+#### 4. Model Library Management: Pull, Rm, and Runtime Directory Overrides (`src/model/pull.rs`, `src/cli/pull.rs`, `src/cli/rm.rs`, `src/server/routes.rs`)
+* **CLI `hypura pull <model>` & Ollama `POST /api/pull`**: Added model downloading with live resume (`curl -C - -L`), progress bar, speed reporting, and Ollama-compatible NDJSON streaming (`{"status": "downloading", "total": ..., "completed": ...}`).
+* **Model Alias Resolution**: Resolves top 2026/2025 coding & tool-calling models (`gemma-4:26b`, `gemma-4:31b`, `qwen3.8:27b`, `qwen2.5-coder:32b`, `mistral-small:24b`, `deepseek-coder-v2-lite`), arbitrary HuggingFace repos (`owner/repo:quant`), and direct GGUF URLs.
+* **CLI `hypura rm <model>` & Ollama `DELETE /api/delete`**: Safely removes model files (and all multi-shard parts) from the library, automatically unloads active instances if needed, and refreshes the model registry.
+* **Runtime Models Directory Overrides**: Default models library can be overridden at runtime via `--models-dir` CLI flag, `models_dir` JSON parameter in `/api/pull` & `/api/delete`, `HYPURA_MODELS_DIR` environment variable, or automatic fallback to `/Volumes/RealtekData/models`.
+
 ---
 
 ## [0.2.6] - 2026-11-08

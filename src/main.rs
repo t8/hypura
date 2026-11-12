@@ -35,6 +35,26 @@ enum Commands {
         #[arg(long)]
         ollama_models: Option<PathBuf>,
     },
+    /// Pull a model from Hugging Face or registry into the models directory
+    Pull {
+        /// Model name, tag, or Hugging Face repo (e.g. gemma-4:26b, qwen3.8:27b, owner/repo:quant)
+        model: String,
+        /// Target models directory (defaults to configured models directory or /Volumes/RealtekData/models)
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+        /// Overwrite existing file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove/delete a model and free disk space
+    #[command(alias = "delete")]
+    Rm {
+        /// Model name, tag, or file path to remove
+        model: String,
+        /// Target models directory
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+    },
     /// List currently running and active loaded models
     Ps {
         /// Host of the running Hypura server
@@ -150,6 +170,15 @@ fn main() -> anyhow::Result<()> {
             models_dir,
             ollama_models,
         } => cli::list::run(models_dir, ollama_models),
+        Commands::Pull {
+            model,
+            models_dir,
+            force,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cli::pull::run(model, models_dir, force))
+        }
+        Commands::Rm { model, models_dir } => cli::rm::run(model, models_dir),
         Commands::Ps { host, port } => cli::ps::run(&host, port),
         Commands::Run {
             model,

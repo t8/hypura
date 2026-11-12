@@ -799,6 +799,25 @@ pub fn sse_openai_completion_stream(
     Body::from_stream(ReceiverStream::new(rx))
 }
 
+/// Convert a pull progress receiver into an NDJSON streaming body for `/api/pull`.
+pub fn ndjson_pull_stream(
+    mut progress_rx: mpsc::Receiver<crate::server::ollama_types::PullResponseChunk>,
+) -> Body {
+    let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>(32);
+
+    tokio::spawn(async move {
+        while let Some(chunk) = progress_rx.recv().await {
+            let mut line = serde_json::to_string(&chunk).unwrap_or_default();
+            line.push('\n');
+            if tx.send(Ok(line)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
