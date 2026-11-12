@@ -352,21 +352,9 @@ pub fn detect_ollama_dir() -> Option<PathBuf> {
         }
     }
 
-    // Direct RealtekData Ollama location if available
-    let realtek_ollama = PathBuf::from("/Volumes/RealtekData/OllamaModels");
-    if realtek_ollama.exists() {
-        return Some(realtek_ollama);
-    }
-
     if let Ok(home) = std::env::var("HOME") {
         let default_ollama = PathBuf::from(home).join(".ollama/models");
         if default_ollama.exists() {
-            // Canonicalize in case it is a symlink
-            if let Ok(target) = fs::canonicalize(&default_ollama) {
-                if target.exists() {
-                    return Some(target);
-                }
-            }
             return Some(default_ollama);
         }
     }

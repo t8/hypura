@@ -24,34 +24,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func detectOllamaModelsDir() -> String? {
         let fm = FileManager.default
-        let realtekOllama = "/Volumes/RealtekData/OllamaModels"
-        if fm.fileExists(atPath: realtekOllama) {
-            return realtekOllama
-        }
         let home = NSHomeDirectory()
         let defaultOllama = "\(home)/.ollama/models"
         if fm.fileExists(atPath: defaultOllama) {
-            if let dest = try? fm.destinationOfSymbolicLink(atPath: defaultOllama) {
-                let resolved = dest.hasPrefix("/") ? dest : ("\(home)/.ollama/" + dest)
-                if fm.fileExists(atPath: resolved) {
-                    return resolved
-                }
-            }
             return defaultOllama
+        }
+        if let env = ProcessInfo.processInfo.environment["OLLAMA_MODELS"], fm.fileExists(atPath: env) {
+            return env
         }
         return nil
     }
 
     var modelsDir: String {
         get {
-            // 1. If user previously saved a custom directory and it has models, use it
+            // 1. If user previously saved a custom directory and it exists, use it
             if let saved = UserDefaults.standard.string(forKey: keyModelsDir), !saved.isEmpty {
-                if folderHasModels(saved) {
+                if saved != "/Volumes/RealtekData/OllamaModels" && FileManager.default.fileExists(atPath: saved) {
                     return saved
                 }
             }
 
-            // 2. Automatically detect and prioritize Ollama models folder if it exists
+            // 2. Automatically detect and prioritize standard Ollama models folder if it exists
             if let ollamaDir = detectOllamaModelsDir() {
                 return ollamaDir
             }
@@ -132,6 +125,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ensureCliInstalled()
         startServer()
         buildMenu()
+    }
+
+    func isCliInstalled() -> Bool {
+        let symlink = "\(NSHomeDirectory())/.local/bin/hypura"
+        return FileManager.default.fileExists(atPath: symlink)
     }
 
     func ensureCliInstalled() {
@@ -247,6 +245,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let modelsDirItem = NSMenuItem(title: "Open Models Directory...", action: #selector(openModelsDir), keyEquivalent: "m")
         modelsDirItem.target = self
         menu.addItem(modelsDirItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        if isCliInstalled() {
+            let cliItem = NSMenuItem(title: "✓ CLI Installed (~/.local/bin/hypura)", action: #selector(installCliAction), keyEquivalent: "")
+            cliItem.target = self
+            menu.addItem(cliItem)
+        } else {
+            let cliItem = NSMenuItem(title: "Install CLI Command...", action: #selector(installCliAction), keyEquivalent: "i")
+            cliItem.target = self
+            menu.addItem(cliItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -412,7 +422,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func saveSettingsAction() {
         if let dir = modelsDirField?.stringValue, !dir.isEmpty {
-            self.modelsDir = dir
+            let expanded = NSString(string: dir.trimmingCharacters(in: .whitespacesAndNewlines)).expandingTildeInPath
+            self.modelsDir = expanded
         }
         if let pStr = portField?.stringValue, let p = Int(pStr), p > 0 {
             self.port = p
@@ -448,6 +459,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openModelsDir() {
         let url = URL(fileURLWithPath: modelsDir)
         NSWorkspace.shared.open(url)
+    }
+
+    @objc func installCliAction() {
+        ensureCliInstalled()
+        let alert = NSAlert()
+        alert.messageText = "Hypura CLI"
+        alert.informativeText = "Hypura CLI is installed at ~/.local/bin/hypura\n\nRun 'hypura --help' in your terminal.\nMake sure ~/.local/bin is in your PATH."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        buildMenu()
     }
 
     @objc func restartAction() {
