@@ -215,10 +215,37 @@ pub struct TensorInfo {
 
 impl GgufFile {
     /// Open and parse a GGUF file's header (does not load tensor data).
+    /// If the file is the first shard of a multi-part split model (e.g. `*-00001-of-00004.gguf`),
+    /// automatically discovers and appends tensor headers from subsequent shards so the scheduler
+    /// has complete model metadata.
     pub fn open(path: &Path) -> Result<Self, GgufError> {
         let file = std::fs::File::open(path)?;
         let mut reader = io::BufReader::new(file);
-        Self::parse(&mut reader)
+        let mut gguf = Self::parse(&mut reader)?;
+
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if let Some(pos) = stem.find("-00001-of-") {
+                let base_prefix = &stem[..pos];
+                let total_str = &stem[pos + "-00001-of-".len()..];
+                if let Ok(total_shards) = total_str.parse::<u32>() {
+                    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                    for shard_idx in 2..=total_shards {
+                        let shard_name = format!("{}-{:05}-of-{:05}.gguf", base_prefix, shard_idx, total_shards);
+                        let shard_path = parent.join(shard_name);
+                        if shard_path.exists() {
+                            if let Ok(shard_file) = std::fs::File::open(&shard_path) {
+                                let mut shard_reader = io::BufReader::new(shard_file);
+                                if let Ok(shard_gguf) = Self::parse(&mut shard_reader) {
+                                    gguf.tensors.extend(shard_gguf.tensors);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(gguf)
     }
 
     /// Parse GGUF header from any reader.

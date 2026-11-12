@@ -78,7 +78,11 @@ impl LlamaModel {
 
         let mut params = unsafe { hypura_sys::llama_model_default_params() };
         params.n_gpu_layers = n_gpu_layers;
-        params.use_mmap = use_mmap;
+        params.load_mode = if use_mmap {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP
+        } else {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_NONE
+        };
 
         let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
         anyhow::ensure!(!ptr.is_null(), "Failed to load model from {}", path.display());
@@ -104,7 +108,11 @@ impl LlamaModel {
 
         let mut params = unsafe { hypura_sys::llama_model_default_params() };
         params.n_gpu_layers = n_gpu_layers;
-        params.use_mmap = use_mmap;
+        params.load_mode = if use_mmap {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP
+        } else {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_NONE
+        };
         params.tensor_buft_overrides = overrides;
 
         let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
@@ -605,6 +613,7 @@ impl LlamaSampler {
                 hypura_sys::llama_sampler_chain_add(
                     ptr,
                     hypura_sys::llama_sampler_init_penalties(
+                        320_000,
                         params.repeat_last_n,
                         params.repeat_penalty,
                         0.0,

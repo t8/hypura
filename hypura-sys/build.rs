@@ -17,6 +17,7 @@ fn main() {
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_COMMON", "OFF")
+        .define("LLAMA_BUILD_APP", "OFF")
         .define("LLAMA_OPENSSL", "OFF")
         .define("GGML_METAL", "ON")
         .define("GGML_METAL_EMBED_LIBRARY", "ON")

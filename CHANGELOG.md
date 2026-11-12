@@ -59,6 +59,15 @@ All notable changes to the **Hypura** project are documented in this file.
 * **Flexible CLI Model Selection**: Added `-m, --model <NAME>` flag support in addition to positional arguments for `hypura serve` to prevent unexpected argument errors with complex parameter orders.
 * **Qwen 3.8 Flash Next Turnkey Launcher (`start_qwen_flash.sh`)**: Added production startup script configuring 32k context, 600s idle memory timeout, `q8_0` KV quantization, external model directory mapping, and Tailscale Funnel endpoint display.
 
+#### 11. Multi-Shard GGUF Discovery, Qwen 3.8 Flash Next Architecture & Q2_0 Quantization Support (`src/model/gguf.rs`, `src/server/registry.rs`, `src/server/manager.rs`, `src/compute/ffi.rs`, `vendor/llama.cpp`)
+* **Multi-Shard GGUF Parsing & Metadata Aggregation (`src/model/gguf.rs`)**: Extended `GgufFile::open` to detect multi-part sharded models (`*-00001-of-0000X.gguf`) and automatically parse companion shard headers (`00002..=X`), providing the ILP scheduler with full visibility into all 176.9B parameters and 1200+ tensors across shards.
+* **Recursive Model Discovery & Folder Aliasing (`src/server/registry.rs`)**: Implemented recursive scanning (up to depth 4) to find models stored in nested subdirectories (e.g. `qwen3.8-flash-next/UD-IQ3_XXS/`), added `is_non_first_shard` filter to register only the primary shard, computed cumulative multi-shard disk footprint (e.g. 77.9 GB total instead of 10 MB for the first header shard), and automatically registered parent folder aliases.
+* **Dynamic Model Manager Resolution (`src/server/manager.rs`)**: Updated initial model pre-warming in `ModelManager::new` to use `get_or_load` instead of direct file path loading, allowing short alias names (e.g. `qwen3.8-flash-next`) to resolve correctly against the registry.
+* **Qwen 3.8 Flash Next (`qwen4exp`) & Q2_0 Engine Support (`vendor/llama.cpp`, `src/compute/ffi.rs`)**:
+  * Upgraded `vendor/llama.cpp` to official `b11048` featuring full support for Alibaba's `qwen4exp` architecture (sparse Gated Delta Net, hyper-connections, QSA indexer, and PLE n-gram table embeddings).
+  * Enabled native support for `GGML_TYPE_Q2_0` (type ID 42) dynamically quantized expert tensors (`blk.*.ffn_down_exps.weight`) across CPU and Apple Silicon Metal shaders.
+  * Adapted `hypura` FFI bindings to use `load_mode` (memory-mapping) and 5-argument penalty sampler initialization. Verified end-to-end inference and token generation.
+
 ---
 
 ## [0.2.5] - 2026-10-06

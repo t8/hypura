@@ -41,8 +41,8 @@ impl ModelManager {
             default_kv_quant,
         };
 
-        if let Some(path_str) = initial_model_path {
-            manager.load_model_by_path(Path::new(path_str), default_context)?;
+        if let Some(initial_name_or_path) = initial_model_path {
+            manager.get_or_load(initial_name_or_path, Some(default_context))?;
         }
 
         Ok(manager)
@@ -203,6 +203,7 @@ impl ModelManager {
     }
 
     /// Load a model directly by file path
+    #[allow(dead_code)]
     fn load_model_by_path(
         &mut self,
         path: &Path,
