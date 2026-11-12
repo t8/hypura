@@ -62,6 +62,8 @@ impl GgufValue {
 
     pub fn as_u32(&self) -> Option<u32> {
         match self {
+            Self::Uint16(v) => Some(*v as u32),
+            Self::Int16(v) => Some(*v as u32),
             Self::Uint32(v) => Some(*v),
             Self::Int32(v) => Some(*v as u32),
             Self::Uint64(v) => Some(*v as u32),
@@ -319,6 +321,14 @@ impl GgufFile {
     /// Total bytes of all tensor data.
     pub fn total_tensor_bytes(&self) -> u64 {
         self.tensors.iter().map(|t| t.size_bytes).sum()
+    }
+
+    /// Returns true if this GGUF file is part of a multi-file split model (e.g. `*-00001-of-00004.gguf`).
+    pub fn is_split(&self) -> bool {
+        self.get_metadata("split.count")
+            .and_then(|v| v.as_u32())
+            .map(|c| c > 1)
+            .unwrap_or_else(|| self.metadata.contains_key("split.no"))
     }
 
     /// Get a metadata value by key.

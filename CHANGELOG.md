@@ -4,6 +4,29 @@ All notable changes to the **Hypura** project are documented in this file.
 
 ---
 
+## [0.2.7] - 2026-11-12
+
+### 🐛 Multi-Shard GGUF & Sparse MoE Reasoning Fixes
+
+#### 1. Multi-Shard Split GGUF Native Mmap Support (`src/model/gguf.rs`, `src/scheduler/placement.rs`, `src/compute/inference.rs`)
+* Added `GgufFile::is_split()` detecting multi-file GGUF partitions (`split.count > 1`, `split.no`, or `*-00001-of-00004.gguf`).
+* Fixed GGUF header parsing for 16-bit metadata fields (`Uint16` / `Int16` in `as_u32()`).
+* Bypassed single-file streaming controllers (`try_expert_streaming_assign`, `try_dense_ffn_streaming_assign`) for split models, automatically remapping `StorageTier::Nvme` to `StorageTier::Ram` so `llama.cpp` natively memory-maps all split shards.
+* Prevented `Hypura_NVMe` custom buffer type from performing single-descriptor `pread` on multi-shard files, which previously caused uninitialized all-zero weights and incoherent token soup across MoE layers.
+* Updated `select_partial_offload_strategy_with_plan` to enforce `PartialOffloadStrategy::StandardMmap` for split models, eliminating 38+ GiB virtual memory allocation spikes caused by cross-shard intra-file offset differences.
+
+#### 2. Submodule Upgrade to `llama.cpp` b12086 (`vendor/llama.cpp`)
+* Upgraded `vendor/llama.cpp` submodule to official release `b12086` (`749db7f03`), preserving custom GLM-4 MLA support while adding official upstream support for `Q2_0` (type 42) and direct QSA attention selection (`build_qsa_sel`).
+* Resolves attention-mask matrix corruption during autoregressive decoding on hybrid SSM/MoE architectures (such as `Qwen 3.8 Flash Next` / `qwen3next`).
+
+#### 3. ModelManager Idle Reaper In-Flight Request Protection (`src/server/manager.rs`)
+* Updated `maybe_unload_idle` to verify active request locks and reference counts (`Arc::strong_count(&active.loaded) > 1 || active.loaded.try_lock().is_err()`).
+* Postpones the idle timeout timestamp (`active.last_used = Instant::now()`) while long prompt prefill or token generation requests are actively executing.
+* Fixed case-insensitive model name matching in `get_or_load` so requests can match active models regardless of capitalization.
+* Increased default `IDLE_TIMEOUT` in `start_qwen_flash.sh` to 1800s (30 minutes).
+
+---
+
 ## [0.2.6] - 2026-11-08
 
 ### 🐛 Bug Fixes & Agentic Coding Optimizations

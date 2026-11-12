@@ -142,7 +142,7 @@ pub fn select_partial_offload_strategy_with_plan(
     let num_layers = (max_layer + 1) as i32;
     let total_offloadable = num_layers + 1; // repeating layers + output layer
 
-    if n_gpu_layers <= 0 {
+    if n_gpu_layers <= 0 || gguf.is_split() {
         return PartialOffloadStrategy::StandardMmap {
             all_layers_on_gpu: false,
         };
@@ -357,10 +357,11 @@ pub fn load_model(
 ) -> anyhow::Result<LoadedModel> {
     let backend = LlamaBackend::init();
 
-    let has_nvme = plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = !gguf.is_split()
+        && plan
+            .tier_assignments
+            .values()
+            .any(|t| *t == StorageTier::Nvme);
 
     // Derive model name from GGUF metadata or filename
     let model_name = gguf
@@ -1613,10 +1614,11 @@ pub fn generate_with_nvme_scheduling(
     let _backend = LlamaBackend::init();
 
     // Check if there are any NVMe tensors
-    let has_nvme = plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = !gguf.is_split()
+        && plan
+            .tier_assignments
+            .values()
+            .any(|t| *t == StorageTier::Nvme);
 
     if !has_nvme {
         let mut loaded = load_model(model_path, config, n_gpu_layers, plan, gguf)?;

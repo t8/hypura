@@ -50,15 +50,19 @@ pub fn compute_placement_with_context_and_kv_quant(
     // Score and sort tensors
     let scored = score_tensors(&model.tensors, &metadata);
 
+    let is_split = model.is_split();
+
     // Try streaming modes: sparse MoE mmap, expert-streaming, then dense FFN-streaming
-    let (tier_assignments, inference_mode) =
+    let (mut tier_assignments, inference_mode) =
         if let Some(assignments) = try_sparse_moe_mmap(&scored, &capacities, &metadata) {
             tracing::info!("Sparse MoE mmap: active working set fits in RAM, using OS page cache");
             (assignments, InferenceMode::SparseMoeMmap)
-        } else if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
+        } else if !is_split && try_expert_streaming_assign(&scored, &capacities, &metadata).is_some() {
+            let es = try_expert_streaming_assign(&scored, &capacities, &metadata).unwrap();
             tracing::info!("Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe");
             (es, InferenceMode::ExpertStreaming)
-        } else if let Some(ds) = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata) {
+        } else if !is_split && try_dense_ffn_streaming_assign(&scored, &capacities, &metadata).is_some() {
+            let ds = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata).unwrap();
             tracing::info!("Dense FFN-streaming placement: attention+norms on GPU, FFN on NVMe");
             (ds, InferenceMode::DenseFfnStreaming)
         } else {
@@ -82,6 +86,23 @@ pub fn compute_placement_with_context_and_kv_quant(
             };
             (assignments, mode)
         };
+
+    if is_split {
+        // Multi-shard split models cannot use single-file NVMe streaming buffer.
+        // Remap any NVMe tier assignments to RAM so llama.cpp natively mmaps all shards.
+        let nvme_remap_count = tier_assignments.values().filter(|t| **t == StorageTier::Nvme).count();
+        if nvme_remap_count > 0 {
+            tracing::info!(
+                "Split model detected: remapping {} NVMe tensors to RAM tier for native multi-shard mmap",
+                nvme_remap_count
+            );
+            for tier in tier_assignments.values_mut() {
+                if *tier == StorageTier::Nvme {
+                    *tier = StorageTier::Ram;
+                }
+            }
+        }
+    }
 
     // Build prefetch schedule
     let prefetch_schedule =

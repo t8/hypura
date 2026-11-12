@@ -58,10 +58,12 @@ impl ModelManager {
     ) -> anyhow::Result<(Arc<std::sync::Mutex<LoadedModel>>, String, GgufInfo)> {
         // 1. Check if an active model matches requested_name
         let active_match = self.active_model.as_ref().map(|active| {
-            active.name.eq_ignore_ascii_case(requested_name)
+            let a_lower = active.name.to_lowercase();
+            let r_lower = requested_name.to_lowercase();
+            a_lower == r_lower
                 || requested_name.is_empty()
-                || active.name.starts_with(requested_name)
-                || requested_name.starts_with(&active.name)
+                || a_lower.starts_with(&r_lower)
+                || r_lower.starts_with(&a_lower)
                 || active.path == std::path::Path::new(requested_name)
         }).unwrap_or(false);
 
@@ -231,7 +233,16 @@ impl ModelManager {
     /// Check if the active model has been idle for longer than `idle_timeout` and unload it if so.
     /// Returns true if a model was unloaded.
     pub fn maybe_unload_idle(&mut self, idle_timeout: std::time::Duration) -> bool {
-        if let Some(ref active) = self.active_model {
+        if let Some(ref mut active) = self.active_model {
+            // Ensure we never unload a model while a request is in flight:
+            // 1. Arc::strong_count(&active.loaded) > 1 means an active route handler currently holds a reference.
+            // 2. active.loaded.try_lock().is_err() means a thread is actively executing inference inside the lock.
+            let is_busy = Arc::strong_count(&active.loaded) > 1 || active.loaded.try_lock().is_err();
+            if is_busy {
+                active.last_used = Instant::now();
+                return false;
+            }
+
             if active.last_used.elapsed() >= idle_timeout {
                 tracing::info!(
                     "Active model '{}' has been idle for {:.1}s (timeout: {:.1}s); unloading to reclaim unified memory",
