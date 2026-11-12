@@ -96,7 +96,11 @@ impl ModelRegistry {
         });
 
         if let Some(ref dir) = custom_dir {
-            self.scan_directory(dir, "Custom");
+            if dir.join("manifests").exists() && dir.join("blobs").exists() {
+                self.scan_ollama_models(dir);
+            } else {
+                self.scan_directory(dir, "Custom");
+            }
         }
 
         // 2. Scan current working directory for *.gguf ONLY if not home or root

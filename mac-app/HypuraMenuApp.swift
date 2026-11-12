@@ -12,17 +12,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let keyIdleTimeout = "hypura_idle_timeout"
     let keyKvQuant = "hypura_kv_quant"
 
+    func folderHasModels(_ path: String) -> Bool {
+        let fm = FileManager.default
+        let manifests = "\(path)/manifests"
+        if fm.fileExists(atPath: manifests) {
+            return true
+        }
+        guard let contents = try? fm.contentsOfDirectory(atPath: path) else { return false }
+        return contents.contains(where: { $0.hasSuffix(".gguf") })
+    }
+
+    func detectOllamaModelsDir() -> String? {
+        let fm = FileManager.default
+        let realtekOllama = "/Volumes/RealtekData/OllamaModels"
+        if fm.fileExists(atPath: realtekOllama) {
+            return realtekOllama
+        }
+        let home = NSHomeDirectory()
+        let defaultOllama = "\(home)/.ollama/models"
+        if fm.fileExists(atPath: defaultOllama) {
+            if let dest = try? fm.destinationOfSymbolicLink(atPath: defaultOllama) {
+                let resolved = dest.hasPrefix("/") ? dest : ("\(home)/.ollama/" + dest)
+                if fm.fileExists(atPath: resolved) {
+                    return resolved
+                }
+            }
+            return defaultOllama
+        }
+        return nil
+    }
+
     var modelsDir: String {
         get {
+            // 1. If user previously saved a custom directory and it has models, use it
             if let saved = UserDefaults.standard.string(forKey: keyModelsDir), !saved.isEmpty {
-                return saved
+                if folderHasModels(saved) {
+                    return saved
+                }
             }
+
+            // 2. Automatically detect and prioritize Ollama models folder if it exists
+            if let ollamaDir = detectOllamaModelsDir() {
+                return ollamaDir
+            }
+
+            // 3. Fallback to /Volumes/RealtekData/models if exists
             if FileManager.default.fileExists(atPath: "/Volumes/RealtekData/models") {
                 return "/Volumes/RealtekData/models"
             }
-            if FileManager.default.fileExists(atPath: "/Volumes/RealtekData/OllamaModels") {
-                return "/Volumes/RealtekData/OllamaModels"
-            }
+
             return "\(NSHomeDirectory())/.ollama/models"
         }
         set {
@@ -129,16 +167,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: binaryPath)
-        // Set working directory to /tmp or modelsDir to prevent any home/Music scanning
+        // Explicitly set working directory to /tmp to prevent any $HOME or media scanning
         task.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
-        task.arguments = [
+
+        var args = [
             "serve",
-            "--models-dir", modelsDir,
             "--port", "\(port)",
             "--context", "\(defaultContext)",
             "--idle-timeout", "\(idleTimeout)",
             "--kv-quant", kvQuant
         ]
+
+        let fm = FileManager.default
+        let activeModelsDir = modelsDir
+        if fm.fileExists(atPath: "\(activeModelsDir)/manifests") {
+            args += ["--ollama-models", activeModelsDir]
+        } else {
+            args += ["--models-dir", activeModelsDir]
+            if let ollama = detectOllamaModelsDir() {
+                args += ["--ollama-models", ollama]
+            }
+        }
+
+        task.arguments = args
 
         try? task.run()
         self.process = task
@@ -212,6 +263,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openSettings() {
         if let window = settingsWindow {
+            modelsDirField?.stringValue = modelsDir
+            portField?.stringValue = "\(port)"
+            idleTimeoutField?.stringValue = "\(idleTimeout)"
+            updateStatusUI()
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
