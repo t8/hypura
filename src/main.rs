@@ -92,7 +92,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to bind to
-        #[arg(long, default_value = "8080")]
+        #[arg(short = 'p', long = "port", default_value = "8080")]
         port: u16,
         /// Default context length (can be overridden per request via num_ctx)
         #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "4096")]
