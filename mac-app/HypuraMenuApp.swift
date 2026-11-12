@@ -147,9 +147,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startServer() {
-        if process?.isRunning == true {
-            return
-        }
+        stopServer()
 
         let bundlePath = Bundle.main.bundlePath
         var binaryPath = "\(bundlePath)/Contents/MacOS/hypura-bin"
@@ -165,7 +163,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: binaryPath)
-        // Explicitly set working directory to /tmp to prevent any $HOME or media scanning
         task.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
 
         var args = [
@@ -189,14 +186,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         task.arguments = args
 
-        try? task.run()
-        self.process = task
-        updateStatusUI()
+        let logPath = "/tmp/hypura.log"
+        if !fm.fileExists(atPath: logPath) {
+            fm.createFile(atPath: logPath, contents: nil)
+        }
+        if let logHandle = FileHandle(forWritingAtPath: logPath) {
+            logHandle.seekToEndOfFile()
+            task.standardOutput = logHandle
+            task.standardError = logHandle
+        }
+
+        task.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateStatusUI()
+            }
+        }
+
+        do {
+            try task.run()
+            self.process = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.updateStatusUI()
+            }
+        } catch {
+            NSLog("Hypura start error: \(error)")
+        }
     }
 
     func stopServer() {
-        if let p = process, p.isRunning {
-            p.terminate()
+        if let p = process {
+            if p.isRunning {
+                p.terminate()
+                p.waitUntilExit()
+            }
         }
         process = nil
         updateStatusUI()
@@ -204,10 +226,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func restartServer() {
         stopServer()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.startServer()
-            self?.buildMenu()
-            self?.updateStatusUI()
         }
     }
 
@@ -257,6 +277,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             cliItem.target = self
             menu.addItem(cliItem)
         }
+
+        let logsItem = NSMenuItem(title: "View Server Logs (/tmp/hypura.log)", action: #selector(viewLogsAction), keyEquivalent: "")
+        logsItem.target = self
+        menu.addItem(logsItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -470,6 +494,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "OK")
         alert.runModal()
         buildMenu()
+    }
+
+    @objc func viewLogsAction() {
+        let path = "/tmp/hypura.log"
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
     @objc func restartAction() {
