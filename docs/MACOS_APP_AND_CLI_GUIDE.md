@@ -126,3 +126,4 @@ Hypura defaults to standard model discovery (`~/.ollama/models`, `/Volumes/Realt
 1. **CLI Flag**: Pass `--models-dir <PATH>` to any CLI command (`serve`, `list`, `run`, `estimate`, `pull`, `rm`).
 2. **Environment Variable**: Set `export HYPURA_MODELS_DIR=/Volumes/RealtekData/models`.
 3. **HTTP API Request**: Include `"models_dir": "/path/to/models"` in your `/api/pull` or `/api/delete` JSON body.
+

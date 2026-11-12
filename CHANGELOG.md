@@ -31,6 +31,11 @@ All notable changes to the **Hypura** project are documented in this file.
 * **CLI `hypura rm <model>` & Ollama `DELETE /api/delete`**: Safely removes model files (and all multi-shard parts) from the library, automatically unloads active instances if needed, and refreshes the model registry.
 * **Runtime Models Directory Overrides**: Default models library can be overridden at runtime via `--models-dir` CLI flag, `models_dir` JSON parameter in `/api/pull` & `/api/delete`, `HYPURA_MODELS_DIR` environment variable, or automatic fallback to `/Volumes/RealtekData/models`.
 
+#### 5. Native macOS Settings Window & Permission Protection (`mac-app/HypuraMenuApp.swift`, `src/server/registry.rs`)
+* **macOS Settings / Preferences Window**: Added AppKit preferences window to `Hypura.app` with folder browser (`NSOpenPanel`), port input, context size dropdown (`32k`, `16k`, `8k`, `4k`), idle timeout, KV quantization (`q8_0`, `q4_0`, `f16`), server start/stop/restart controls, and persistent storage via `UserDefaults`.
+* **TCC Permission Protection**: Prevented recursive scanning of `$HOME` when launched via Finder/LaunchServices, explicitly skipping macOS protected user folders (`Music`, `Pictures`, `Movies`, `Library`, etc.) to eliminate Apple Music/Media authorization dialogs.
+* **Automatic Ollama Storage Discovery**: Automatically detects and resolves `/Volumes/RealtekData/OllamaModels` and `~/.ollama/models` symlinks, discovering existing installed models out-of-the-box.
+
 ---
 
 ## [0.2.6] - 2026-11-08

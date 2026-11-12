@@ -99,9 +99,18 @@ impl ModelRegistry {
             self.scan_directory(dir, "Custom");
         }
 
-        // 2. Scan current working directory for *.gguf
+        // 2. Scan current working directory for *.gguf ONLY if not home or root
         if let Ok(cwd) = std::env::current_dir() {
-            self.scan_directory(&cwd, "Local");
+            let is_home_or_root = if let Ok(home) = std::env::var("HOME") {
+                let home_path = PathBuf::from(home);
+                cwd == home_path || cwd == Path::new("/") || cwd.starts_with(home_path.join("Library"))
+            } else {
+                cwd == Path::new("/")
+            };
+
+            if !is_home_or_root {
+                self.scan_directory(&cwd, "Local");
+            }
         }
 
         // 3. Scan Ollama models directory
@@ -176,8 +185,19 @@ impl ModelRegistry {
                 }
             } else if path.is_dir() && depth < max_depth {
                 let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                // Skip hidden directories like .cache, .git
-                if !name.starts_with('.') {
+                // Skip hidden directories and macOS TCC-protected directories to prevent permission popups
+                let is_protected_or_hidden = name.starts_with('.')
+                    || name.eq_ignore_ascii_case("Music")
+                    || name.eq_ignore_ascii_case("Pictures")
+                    || name.eq_ignore_ascii_case("Movies")
+                    || name.eq_ignore_ascii_case("Library")
+                    || name.eq_ignore_ascii_case("Desktop")
+                    || name.eq_ignore_ascii_case("Documents")
+                    || name.eq_ignore_ascii_case("Downloads")
+                    || name.ends_with(".photoslibrary")
+                    || name.eq_ignore_ascii_case(".Trash");
+
+                if !is_protected_or_hidden {
                     self.scan_directory_recursive(root_dir, &path, source_label, depth + 1, max_depth);
                 }
             }
@@ -328,9 +348,21 @@ pub fn detect_ollama_dir() -> Option<PathBuf> {
         }
     }
 
+    // Direct RealtekData Ollama location if available
+    let realtek_ollama = PathBuf::from("/Volumes/RealtekData/OllamaModels");
+    if realtek_ollama.exists() {
+        return Some(realtek_ollama);
+    }
+
     if let Ok(home) = std::env::var("HOME") {
         let default_ollama = PathBuf::from(home).join(".ollama/models");
         if default_ollama.exists() {
+            // Canonicalize in case it is a symlink
+            if let Ok(target) = fs::canonicalize(&default_ollama) {
+                if target.exists() {
+                    return Some(target);
+                }
+            }
             return Some(default_ollama);
         }
     }
