@@ -134,6 +134,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        stopServer()
+    }
+
     func isCliInstalled() -> Bool {
         let symlink = "\(NSHomeDirectory())/.local/bin/hypura"
         return FileManager.default.fileExists(atPath: symlink)
@@ -220,6 +224,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func killOrphanedServers() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        task.arguments = ["-9", "-f", "hypura-bin serve"]
+        try? task.run()
+        task.waitUntilExit()
+    }
+
     func stopServer() {
         if let p = process {
             if p.isRunning {
@@ -228,6 +240,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         process = nil
+        killOrphanedServers()
         updateStatusUI()
     }
 
@@ -239,21 +252,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateStatusUI() {
-        let isRunning = process?.isRunning ?? false
-        let statusText = isRunning ? "🟢 Running on port \(port)" : "🔴 Server Stopped"
-        statusLabel?.stringValue = statusText
-        toggleServerButton?.title = isRunning ? "Stop Server" : "Start Server"
-        buildMenu()
+        let isLocalRunning = process?.isRunning ?? false
+        if isLocalRunning {
+            self.applyStatusUI(running: true)
+            return
+        }
+
+        // Fast probe localhost:port to check if an existing instance is responding
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/tags") else {
+            self.applyStatusUI(running: false)
+            return
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 0.5
+        URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
+            let isHttpRunning = (resp as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async {
+                self?.applyStatusUI(running: isHttpRunning)
+            }
+        }.resume()
     }
 
-    func buildMenu() {
+    func applyStatusUI(running: Bool) {
+        let statusText = running ? "🟢 Running on port \(port)" : "🔴 Server Stopped"
+        statusLabel?.stringValue = statusText
+        toggleServerButton?.title = running ? "Stop Server" : "Start Server"
+        buildMenu(running: running)
+    }
+
+    func buildMenu(running: Bool? = nil) {
         let menu = NSMenu()
 
         let titleItem = NSMenuItem(title: "Hypura Server", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
 
-        let isRunning = process?.isRunning ?? false
+        let isRunning = running ?? (process?.isRunning ?? false)
         let statusText = isRunning ? "🟢 Running on port \(port)" : "🔴 Stopped"
         let statusItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         statusItem.isEnabled = false
