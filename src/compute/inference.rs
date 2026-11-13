@@ -56,21 +56,269 @@ pub struct GenerationResult {
     pub perf: PerfData,
 }
 
+/// In-memory serialized state checkpoint of a completed prompt prefill or turn boundary.
+#[derive(Clone)]
+struct StateCheckpoint {
+    tokens: Vec<i32>,
+    state_bytes: Arc<Vec<u8>>,
+}
+
+/// Persistent inference context & token history cached across HTTP requests for prefix KV reuse.
+struct CachedSession {
+    ctx: LlamaContext,
+    n_ctx: u32,
+    tokens: Vec<i32>,
+    checkpoints: Vec<StateCheckpoint>,
+}
+
 /// A loaded model that can serve multiple generation requests.
 ///
-/// Holds the llama.cpp backend, model, and NVMe scheduling state.
-/// Context + sampler are created fresh per request (cheap to create, expensive to keep).
+/// Holds the llama.cpp backend, model, persistent KV session, and NVMe scheduling state.
+/// Note: `cached_session` is declared first so `LlamaContext` drops before `LlamaModel`.
 pub struct LoadedModel {
+    cached_session: Option<CachedSession>,
     pub _backend: LlamaBackend,
     pub model: LlamaModel,
     pub config: InferenceConfig,
     pub n_gpu_layers: i32,
+    pub all_layers_on_gpu: bool,
     pub model_name: String,
     pub kv_quantization: Option<crate::scheduler::types::KvQuantization>,
     // NVMe scheduling state (None when all tensors fit in GPU+RAM)
     _controller: Option<Box<HypuraBuftController>>,
     prefetch_state: Option<Arc<PrefetchState>>,
-    keep_resident: bool,
+    _keep_resident: bool,
+}
+
+/// Strategy for loading a non-NVMe model onto Metal + CPU without over-wiring unified memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialOffloadStrategy {
+    /// Standard zero-copy mmap without overrides.
+    StandardMmap { all_layers_on_gpu: bool },
+    /// Keep zero-copy mmap enabled, overriding only the non-contiguous output-head tensor(s)
+    /// (e.g. tied `token_embd.weight` at file offset 0) onto the CPU buffer type while keeping
+    /// any output-head tensors contiguous with the GPU layers (e.g. `output_norm.weight` or
+    /// `output.weight` at the end of the file) on Metal GPU.
+    MmapWithCpuOutputOverride { override_regex: String },
+    /// Disable mmap (`use_mmap = false`) when GPU-assigned tensors are interleaved with
+    /// >512 MiB of CPU tensors inside the GGUF file, forcing Metal to allocate exact GPU bytes.
+    NoMmapExactAlloc,
+}
+
+fn escape_regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if matches!(c, '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Inspect GGUF tensor file offsets to prevent `llama.cpp`'s `get_mapping_range` from
+/// wiring the entire GGUF file into a Metal `MTLResidencySet` during partial GPU offload.
+pub fn select_partial_offload_strategy(
+    gguf: &GgufFile,
+    n_gpu_layers: i32,
+) -> PartialOffloadStrategy {
+    select_partial_offload_strategy_with_plan(gguf, n_gpu_layers, None)
+}
+
+pub fn select_partial_offload_strategy_with_plan(
+    gguf: &GgufFile,
+    n_gpu_layers: i32,
+    plan: Option<&PlacementPlan>,
+) -> PartialOffloadStrategy {
+    let max_layer = match gguf.tensors.iter().filter_map(|t| t.layer_index).max() {
+        Some(m) => m,
+        None => {
+            return PartialOffloadStrategy::StandardMmap {
+                all_layers_on_gpu: n_gpu_layers > 0,
+            }
+        }
+    };
+
+    let num_layers = (max_layer + 1) as i32;
+    let total_offloadable = num_layers + 1; // repeating layers + output layer
+
+    if n_gpu_layers <= 0 || gguf.is_split() {
+        return PartialOffloadStrategy::StandardMmap {
+            all_layers_on_gpu: false,
+        };
+    }
+
+    let has_ram_spill = plan.map_or(false, |p| {
+        p.tier_assignments
+            .values()
+            .any(|t| *t != StorageTier::Gpu)
+    });
+
+    if n_gpu_layers >= total_offloadable && !has_ram_spill {
+        return PartialOffloadStrategy::StandardMmap {
+            all_layers_on_gpu: true,
+        };
+    }
+
+    // Partial GPU offload: llama.cpp assigns layers [i_gpu_start .. num_layers-1] + output to GPU.
+    let i_gpu_start = (num_layers + 1 - n_gpu_layers).max(0) as u32;
+    let mut rep_bytes: u64 = 0;
+    let mut rep_min = u64::MAX;
+    let mut rep_max = 0u64;
+
+    for t in &gguf.tensors {
+        if let Some(l) = t.layer_index {
+            if l >= i_gpu_start {
+                rep_bytes += t.size_bytes;
+                rep_min = rep_min.min(t.offset);
+                rep_max = rep_max.max(t.offset.saturating_add(t.size_bytes));
+            }
+        }
+    }
+
+    if rep_bytes == 0 || rep_min >= rep_max {
+        return PartialOffloadStrategy::StandardMmap {
+            all_layers_on_gpu: false,
+        };
+    }
+
+    const MAX_MMAP_SLACK_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+    let span_without_output = rep_max.saturating_sub(rep_min);
+    if span_without_output > rep_bytes.saturating_add(MAX_MMAP_SLACK_BYTES) {
+        tracing::info!(
+            "Partial GPU offload ({}/{} layers): GGUF GPU tensors span {:.2} GiB for {:.2} GiB weights; disabling mmap for exact Metal allocation",
+            n_gpu_layers,
+            total_offloadable,
+            span_without_output as f64 / (1u64 << 30) as f64,
+            rep_bytes as f64 / (1u64 << 30) as f64,
+        );
+        return PartialOffloadStrategy::NoMmapExactAlloc;
+    }
+
+    let has_explicit_output = gguf.tensors.iter().any(|t| t.name == "output.weight");
+    let mut output_candidates: Vec<&crate::model::gguf::TensorInfo> = gguf
+        .tensors
+        .iter()
+        .filter(|t| {
+            t.layer_index.is_none()
+                && (t.name.starts_with("output.")
+                    || t.name.starts_with("output_norm.")
+                    || (!has_explicit_output && t.name == "token_embd.weight"))
+        })
+        .collect();
+
+    // Sort output candidates by distance to [rep_min .. rep_max] so contiguous tensors at the
+    // end of the GGUF file are absorbed into the GPU mmap range first.
+    output_candidates.sort_by_key(|t| {
+        let t_end = t.offset.saturating_add(t.size_bytes);
+        if t.offset >= rep_max {
+            t.offset - rep_max
+        } else if t_end <= rep_min {
+            rep_min - t_end
+        } else {
+            0
+        }
+    });
+
+    let mut cur_bytes = rep_bytes;
+    let mut cur_min = rep_min;
+    let mut cur_max = rep_max;
+    let mut all_min = rep_min;
+    let mut all_max = rep_max;
+    let mut non_contiguous_names: Vec<String> = Vec::new();
+
+    for t in output_candidates {
+        let t_end = t.offset.saturating_add(t.size_bytes);
+        all_min = all_min.min(t.offset);
+        all_max = all_max.max(t_end);
+
+        let cand_min = cur_min.min(t.offset);
+        let cand_max = cur_max.max(t_end);
+        let cand_bytes = cur_bytes.saturating_add(t.size_bytes);
+        let cand_span = cand_max.saturating_sub(cand_min);
+
+        // When all repeating layers fit on GPU (`i_gpu_start == 0`) but the model has a RAM spill,
+        // keep large (`>= 128 MiB`) output / tied-embedding tensors on CPU so Metal only wires
+        // the repeating layers (`~14.06 GiB` on Qwen 3.8 27B instead of `15.65 GiB`).
+        let force_cpu_for_budget = has_ram_spill && t.size_bytes >= 128 * 1024 * 1024;
+
+        if !force_cpu_for_budget && cand_span <= cand_bytes.saturating_add(MAX_MMAP_SLACK_BYTES) {
+            cur_min = cand_min;
+            cur_max = cand_max;
+            cur_bytes = cand_bytes;
+        } else {
+            non_contiguous_names.push(t.name.clone());
+        }
+    }
+
+    // Ensure any sparse N-gram / PLE embedding tables (e.g. Qwen 3.8 Flash Next 51B table)
+    // are explicitly overridden onto the CPU buffer type so they are never wired into Metal GPU residency.
+    for t in &gguf.tensors {
+        let name_lower = t.name.to_ascii_lowercase();
+        if (name_lower.contains("ngram") || name_lower.contains("ple_") || name_lower.contains("n_gram"))
+            && !non_contiguous_names.contains(&t.name)
+        {
+            non_contiguous_names.push(t.name.clone());
+        }
+    }
+
+    if non_contiguous_names.is_empty() {
+        PartialOffloadStrategy::StandardMmap {
+            all_layers_on_gpu: n_gpu_layers >= total_offloadable,
+        }
+    } else {
+        let escaped: Vec<String> = non_contiguous_names
+            .iter()
+            .map(|n| escape_regex_literal(n))
+            .collect();
+        let override_regex = format!("^({})$", escaped.join("|"));
+        let kept_span = cur_max.saturating_sub(cur_min);
+        let full_span = all_max.saturating_sub(all_min);
+        tracing::info!(
+            "Partial GPU offload ({}/{} layers): overriding {:?} to CPU so Metal wires {:.2} GiB instead of {:.2} GiB via mmap",
+            n_gpu_layers,
+            total_offloadable,
+            non_contiguous_names,
+            kept_span as f64 / (1u64 << 30) as f64,
+            full_span as f64 / (1u64 << 30) as f64,
+        );
+        PartialOffloadStrategy::MmapWithCpuOutputOverride { override_regex }
+    }
+}
+
+fn load_non_nvme_llama_model(
+    model_path: &Path,
+    n_gpu_layers: i32,
+    gguf: &GgufFile,
+    plan: &PlacementPlan,
+) -> anyhow::Result<(LlamaModel, bool)> {
+    match select_partial_offload_strategy_with_plan(gguf, n_gpu_layers, Some(plan)) {
+        PartialOffloadStrategy::StandardMmap { all_layers_on_gpu } => {
+            let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
+            Ok((model, all_layers_on_gpu))
+        }
+        PartialOffloadStrategy::MmapWithCpuOutputOverride { override_regex } => {
+            let cpu_buft = unsafe { hypura_sys::ggml_backend_cpu_buffer_type() };
+            let pattern = std::ffi::CString::new(override_regex)?;
+            let overrides = [
+                hypura_sys::llama_model_tensor_buft_override {
+                    pattern: pattern.as_ptr(),
+                    buft: cpu_buft,
+                },
+                hypura_sys::llama_model_tensor_buft_override {
+                    pattern: std::ptr::null(),
+                    buft: std::ptr::null_mut(),
+                },
+            ];
+            let model =
+                LlamaModel::load_with_overrides(model_path, n_gpu_layers, true, overrides.as_ptr())?;
+            Ok((model, false))
+        }
+        PartialOffloadStrategy::NoMmapExactAlloc => {
+            let model = LlamaModel::load(model_path, n_gpu_layers, false)?;
+            Ok((model, false))
+        }
+    }
 }
 
 // SAFETY: All access to LoadedModel is serialized under std::sync::Mutex
@@ -79,6 +327,8 @@ unsafe impl Send for LoadedModel {}
 
 impl Drop for LoadedModel {
     fn drop(&mut self) {
+        // Free LlamaContext before stopping the NVMe I/O pool or freeing LlamaModel
+        self.cached_session = None;
         if let Some(ref state) = self.prefetch_state {
             state.stop_io_pool();
         }
@@ -107,10 +357,11 @@ pub fn load_model(
 ) -> anyhow::Result<LoadedModel> {
     let backend = LlamaBackend::init();
 
-    let has_nvme = plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = !gguf.is_split()
+        && plan
+            .tier_assignments
+            .values()
+            .any(|t| *t == StorageTier::Nvme);
 
     // Derive model name from GGUF metadata or filename
     let model_name = gguf
@@ -124,17 +375,20 @@ pub fn load_model(
         });
 
     if !has_nvme {
-        let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
+        let (model, all_layers_on_gpu) =
+            load_non_nvme_llama_model(model_path, n_gpu_layers, gguf, plan)?;
         return Ok(LoadedModel {
+            cached_session: None,
             _backend: backend,
             model,
             config: config.clone(),
             n_gpu_layers,
+            all_layers_on_gpu,
             model_name,
             kv_quantization: plan.kv_cache_plan.kv_quantization,
             _controller: None,
             prefetch_state: None,
-            keep_resident: false,
+            _keep_resident: false,
         });
     }
 
@@ -150,8 +404,19 @@ pub fn load_model(
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
+    let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
+    let dense_ffn_streaming = plan.inference_mode == InferenceMode::DenseFfnStreaming;
+    let any_streaming = expert_streaming || dense_ffn_streaming;
+
+    // Expert/dense-FFN streaming: use_mmap=false so Metal creates individual GPU buffers
+    // for resident tensors instead of one giant MTLBuffer for the entire model file.
+    let use_mmap = !any_streaming;
+    if dense_ffn_streaming {
+        controller.enable_dense_ffn_scratch(gguf);
+    }
+
     let model =
-        LlamaModel::load_with_overrides(model_path, n_gpu_layers, true, overrides.as_ptr())?;
+        LlamaModel::load_with_overrides(model_path, n_gpu_layers, use_mmap, overrides.as_ptr())?;
 
     let num_layers = model.n_layers() as u32;
 
@@ -193,28 +458,91 @@ pub fn load_model(
     let max_ram_limit = (total_ram as f64 * 0.90) as u64;
     let effective_max_ram = max_ram_limit.min(total_ram.saturating_sub(headroom));
 
-    let keep_resident = nvme_bytes > 0
+    let keep_resident = !any_streaming
+        && nvme_bytes > 0
         && (estimated_committed + nvme_bytes) <= effective_max_ram;
 
     let should_preload = keep_resident
         && (estimated_committed + nvme_bytes) <= effective_max_ram.saturating_sub(2 * (1 << 30));
 
-    if keep_resident {
-        tracing::info!(
-            "NVMe keep-resident mode: {:.2} GB NVMe spill, est. committed {:.1}/{:.1} GB",
-            nvme_bytes as f64 / (1u64 << 30) as f64,
-            (estimated_committed + nvme_bytes) as f64 / (1u64 << 30) as f64,
-            total_ram as f64 / (1u64 << 30) as f64,
+    if any_streaming {
+        let metadata_for_budget = ModelMetadata::from_gguf(gguf).ok();
+        let head_dim = metadata_for_budget
+            .as_ref()
+            .map(|m| if m.num_heads > 0 { m.embedding_dim as u64 / m.num_heads as u64 } else { 0 })
+            .unwrap_or(0);
+        let num_kv_heads = metadata_for_budget.as_ref().map(|m| m.num_kv_heads).unwrap_or(0);
+        let memory_budget = MemoryBudget::compute(
+            total_ram,
+            gpu_bytes,
+            false,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            config.n_ctx,
+            plan.kv_cache_plan.kv_quantization,
         );
-    } else if nvme_bytes > 0 {
-        tracing::info!(
-            "NVMe streaming mode: {:.2} GB NVMe spill",
-            nvme_bytes as f64 / (1u64 << 30) as f64,
-        );
+        if expert_streaming {
+            let num_experts = gguf.get_u32("expert_count").unwrap_or(8);
+            let expert_slot_size = gguf
+                .tensors
+                .iter()
+                .filter(|t| matches!(TensorRole::from_name(&t.name), TensorRole::MoeFusedExperts))
+                .map(|t| t.size_bytes)
+                .max()
+                .unwrap_or(1);
+            let num_slots = memory_budget.pool_slots(expert_slot_size, 6, 18);
+            let pool = controller.activate_expert_pool(gguf, num_experts, num_slots)?;
+            *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
+            let tensor_ptrs = controller.take_tensor_ptrs();
+            let state_mut = unsafe { &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState) };
+            state_mut.fused_tensor_ptrs = tensor_ptrs;
+            prefetch_state
+                .expert_streaming
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if dense_ffn_streaming {
+            let ffn_slot_size = gguf
+                .tensors
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        TensorRole::from_name(&t.name),
+                        TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                    )
+                })
+                .map(|t| t.size_bytes)
+                .max()
+                .unwrap_or(1);
+            let num_slots = memory_budget.pool_slots(ffn_slot_size, 6, 24);
+            let pool = controller.activate_dense_ffn_pool(gguf, num_slots)?;
+            let lookahead = ((num_slots / 3).saturating_sub(1)).max(1) as u32;
+            *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
+            let tensor_ptrs = controller.take_tensor_ptrs();
+            let state_mut = unsafe { &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState) };
+            state_mut.fused_tensor_ptrs = tensor_ptrs;
+            state_mut.dense_ffn_lookahead = lookahead;
+            prefetch_state
+                .dense_ffn_streaming
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    } else {
+        if keep_resident {
+            tracing::info!(
+                "NVMe keep-resident mode: {:.2} GB NVMe spill, est. committed {:.1}/{:.1} GB",
+                nvme_bytes as f64 / (1u64 << 30) as f64,
+                (estimated_committed + nvme_bytes) as f64 / (1u64 << 30) as f64,
+                total_ram as f64 / (1u64 << 30) as f64,
+            );
+        } else if nvme_bytes > 0 {
+            tracing::info!(
+                "NVMe streaming mode: {:.2} GB NVMe spill",
+                nvme_bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
+        prefetch_state
+            .keep_nvme_resident
+            .store(keep_resident, std::sync::atomic::Ordering::Relaxed);
     }
-    prefetch_state
-        .keep_nvme_resident
-        .store(keep_resident, std::sync::atomic::Ordering::Relaxed);
 
     // Start multi-threaded I/O pool
     let num_io_workers = (num_performance_cores() as usize / 2).clamp(2, 4);
@@ -229,8 +557,10 @@ pub fn load_model(
         );
     }
 
-    // Initial NVMe prefetch
-    prefetch_state.prefetch_all_nvme();
+    // Initial NVMe prefetch (skip in pool modes where slots load on demand)
+    if !any_streaming {
+        prefetch_state.prefetch_all_nvme();
+    }
 
     if keep_resident {
         prefetch_state
@@ -239,15 +569,17 @@ pub fn load_model(
     }
 
     Ok(LoadedModel {
+        cached_session: None,
         _backend: backend,
         model,
         config: config.clone(),
         n_gpu_layers,
+        all_layers_on_gpu: false,
         model_name,
         kv_quantization: plan.kv_cache_plan.kv_quantization,
         _controller: Some(controller),
         prefetch_state: Some(prefetch_state),
-        keep_resident,
+        _keep_resident: keep_resident,
     })
 }
 
@@ -321,6 +653,49 @@ pub fn find_matching_brace(s: &str) -> Option<usize> {
     None
 }
 
+/// Extract the portion of `text` that follows all closed reasoning/thought blocks.
+/// Returns `None` if an opening thought tag has been emitted without its closing tag yet
+/// (meaning the model is actively thinking and must NOT be cut off by tool-call heuristics).
+fn post_thought_slice(mut text: &str) -> Option<&str> {
+    let thought_pairs = [
+        ("<|channel>thought", "<channel|>"),
+        ("<|channel|>thought", "<|end|>"),
+        ("<|channel|>thought", "<channel|>"),
+        ("<|channel|>analysis", "<|end|>"),
+        ("<|thought>", "<thought|>"),
+        ("<|thought>", "</thought|>"),
+        ("<thought>", "</thought>"),
+        ("<think>", "</think>"),
+        ("[THINK]", "[/THINK]"),
+    ];
+
+    loop {
+        let trimmed = text.trim_start();
+        let mut matched_pair = false;
+        for (open_tag, close_tag) in thought_pairs {
+            if let Some(after_open) = trimmed.strip_prefix(open_tag) {
+                if let Some(close_idx) = after_open.find(close_tag) {
+                    text = &after_open[close_idx + close_tag.len()..];
+                    matched_pair = true;
+                    break;
+                }
+                // Also handle <|channel|>thought closed by either <|end|> or <channel|>
+                if open_tag == "<|channel|>thought" {
+                    if let Some(alt_idx) = after_open.find("<channel|>") {
+                        text = &after_open[alt_idx + "<channel|>".len()..];
+                        matched_pair = true;
+                        break;
+                    }
+                }
+                return None;
+            }
+        }
+        if !matched_pair {
+            return Some(text);
+        }
+    }
+}
+
 /// Check if generation should terminate early due to stop tokens, turn boundaries, or tool call completion.
 pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool {
     // 1. User/client-specified stop sequences
@@ -330,11 +705,13 @@ pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool 
         }
     }
 
-    // 2. ChatML & Qwen stop / turn boundary tokens
+    // 2. ChatML, Qwen & Nemotron stop / turn boundary tokens
     if generated_text.contains("<|im_end|>")
         || generated_text.contains("<|im_start|>")
         || generated_text.contains("<|endoftext|>")
         || generated_text.contains("<|eot_id|>")
+        || generated_text.contains("<SPECIAL_12>")
+        || generated_text.contains("<SPECIAL_11>")
     {
         return true;
     }
@@ -361,22 +738,32 @@ pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool 
         return true;
     }
 
+    // Only inspect content AFTER any completed reasoning/thought channel.
+    // While the model is inside an unclosed thought block (`None`), never trigger
+    // tool-call closure stops on hypothetical XML/JSON tags mentioned during CoT.
+    let Some(after_thought) = post_thought_slice(generated_text) else {
+        return false;
+    };
+
     // 5. Tool call closure tags or complete JSON tool call objects
-    if generated_text.contains("</tool_call>")
-        || generated_text.contains("</tool__call>")
-        || generated_text.contains("</toolcall>")
-        || generated_text.contains("<tool_call|>")
-        || generated_text.contains("</function>")
-        || generated_text.contains("[/TOOL_CALLS]")
-        || (generated_text.contains("<|tool_call|>") && (generated_text.ends_with('}') || generated_text.ends_with(']')))
+    if after_thought.contains("</tool_call>")
+        || after_thought.contains("</tool__call>")
+        || after_thought.contains("</toolcall>")
+        || after_thought.contains("</TOOLCALL>")
+        || after_thought.contains("<tool_call|>")
+        || after_thought.contains("<call|>")
+        || (!after_thought.contains("<tool_call>") && after_thought.contains("</function>"))
+        || after_thought.contains("[/TOOL_CALLS]")
+        || (after_thought.contains("<|tool_call|>")
+            && (after_thought.ends_with('}') || after_thought.ends_with(']')))
     {
         return true;
     }
 
-    let trimmed = generated_text.trim_start();
+    let trimmed = after_thought.trim_start();
 
-    // Check complete [TOOL_CALLS] [...] syntax
-    if let Some(tc_idx) = trimmed.find("[TOOL_CALLS]") {
+    // Check complete [TOOL_CALLS] [...] / [TOOL_CALLS] {...} / [TOOL_CALLS]name[ARGS]{...} syntax
+    if let Some(tc_idx) = trimmed.rfind("[TOOL_CALLS]") {
         let after_tc = trimmed[tc_idx + "[TOOL_CALLS]".len()..].trim_start();
         if after_tc.starts_with('[') {
             if let Some(bracket_len) = find_matching_bracket(after_tc) {
@@ -392,6 +779,18 @@ pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool 
                     return true;
                 }
             }
+        } else if let Some(args_idx) = after_tc.find("[ARGS]") {
+            let after_args = after_tc[args_idx + "[ARGS]".len()..].trim_start();
+            if after_args.starts_with('{') {
+                if let Some(brace_len) = find_matching_brace(after_args) {
+                    let trailing = &after_args[brace_len..];
+                    // Allow chained `[TOOL_CALLS]fn2...` or `</s>`, but stop if model starts
+                    // emitting prose lines after closing the JSON arguments object.
+                    if trailing.starts_with("\n\n") {
+                        return true;
+                    }
+                }
+            }
         }
     }
 
@@ -400,6 +799,7 @@ pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool 
         && !trimmed.starts_with("[TOOL_CALLS]")
         && !trimmed.starts_with("[INST]")
         && !trimmed.starts_with("[AVAILABLE_TOOLS]")
+        && !trimmed.starts_with("[THINK]")
     {
         if let Some(bracket_len) = find_matching_bracket(trimmed) {
             let candidate = &trimmed[..bracket_len];
@@ -420,29 +820,68 @@ pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool 
     }
 
     // 6. Prevent reasoning over-thinking loops (e.g. model finished thinking, gave answer, then reopened <think>)
-    if generated_text.contains("</think>") {
-        if let Some(think_end) = generated_text.find("</think>") {
-            let after_think = &generated_text[think_end + "</think>".len()..];
-            if after_think.contains("<think>") || after_think.contains("<thought>") {
-                return true;
-            }
-        }
-    }
-    if generated_text.contains("</thought>") {
-        if let Some(thought_end) = generated_text.find("</thought>") {
-            let after_thought = &generated_text[thought_end + "</thought>".len()..];
-            if after_thought.contains("<thought>") || after_thought.contains("<think>") {
-                return true;
-            }
+    if after_thought.contains("<think>")
+        || after_thought.contains("<thought>")
+        || after_thought.contains("[THINK]")
+    {
+        let had_closed_thought = generated_text.contains("</think>")
+            || generated_text.contains("</thought>")
+            || generated_text.contains("[/THINK]")
+            || generated_text.contains("<channel|>");
+        if had_closed_thought {
+            return true;
         }
     }
 
     false
 }
 
+fn create_loaded_context(
+    loaded: &LoadedModel,
+    alloc_ctx: u32,
+    n_batch: u32,
+    n_ubatch: u32,
+    n_threads: i32,
+    op_offload: bool,
+) -> anyhow::Result<LlamaContext> {
+    if let Some(ref prefetch_state) = loaded.prefetch_state {
+        let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
+        let ctx_res = LlamaContext::new_with_options(
+            &loaded.model,
+            alloc_ctx,
+            n_batch,
+            n_ubatch,
+            n_threads,
+            Some(eval_callback),
+            state_ptr,
+            loaded.kv_quantization,
+            op_offload,
+        );
+        // Immediately convert back to avoid leak — the PrefetchState is kept alive
+        // by the Arc in LoadedModel, not by this raw pointer.
+        unsafe {
+            Arc::from_raw(state_ptr as *const PrefetchState);
+        }
+        ctx_res
+    } else {
+        LlamaContext::new_with_options(
+            &loaded.model,
+            alloc_ctx,
+            n_batch,
+            n_ubatch,
+            n_threads,
+            None,
+            std::ptr::null_mut(),
+            loaded.kv_quantization,
+            op_offload,
+        )
+    }
+}
+
 /// Generate text from a pre-loaded model.
 ///
-/// Creates a fresh context + sampler per request. The model itself is reused.
+/// Reuses a persistent `LlamaContext` and cached prompt KV prefix across requests
+/// when compatible, and aborts promptly if the HTTP client disconnects.
 pub fn generate_from_loaded(
     loaded: &mut LoadedModel,
     params: GenerateFromLoadedParams<'_>,
@@ -454,7 +893,26 @@ pub fn generate_from_loaded(
         telemetry,
     } = params;
 
-    let config = &loaded.config;
+    if token_tx.is_closed() {
+        anyhow::bail!("Generation cancelled: client disconnected before start");
+    }
+
+    let n_ctx_limit = loaded.config.n_ctx;
+    let n_batch = loaded.config.n_batch;
+    let n_threads = loaded.config.n_threads;
+    let default_ubatch = if loaded.all_layers_on_gpu {
+        n_batch
+    } else {
+        n_batch.min(256)
+    };
+    // Disable `op_offload` during partial GPU offload (`!loaded.all_layers_on_gpu`):
+    // on hybrid recurrent/attention models (like Qwen 3.5 / 3.8 27B), `op_offload = true`
+    // bounces individual matmuls inside CPU layers back and forth across CPU<->Metal,
+    // exploding `graph splits` from 3 to 99 and inflating the Metal compute buffer from
+    // ~83 MiB to >1.24 GiB. With `GGML_CPU_ARM_ARCH=armv8.6-a+dotprod+fp16+i8mm`, CPU layers
+    // execute directly on ARM64 NEON `i8mm` / `dotprod` with only 3 graph splits.
+    let op_offload = loaded.all_layers_on_gpu;
+
     let tokens = loaded.model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
@@ -462,43 +920,53 @@ pub fn generate_from_loaded(
     // Dynamic context calculation: keep within config.n_ctx bounds to ensure
     // KV cache allocations stay within the reserved Metal working set limit.
     let gen_headroom = sampling.max_tokens.min(4096).max(512);
-    let effective_ctx = (prompt_len + gen_headroom).min(config.n_ctx).max(1024);
+    let effective_ctx = (prompt_len + gen_headroom).min(n_ctx_limit).max(1024);
 
-    // Build context — with or without NVMe callback, respecting KV cache quantization
-    let mut ctx = if let Some(ref prefetch_state) = loaded.prefetch_state {
-        let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
-        let ctx = LlamaContext::new_with_callback_and_kv(
-            &loaded.model,
-            effective_ctx,
-            config.n_batch,
-            config.n_threads,
-            Some(eval_callback),
-            state_ptr,
-            loaded.kv_quantization,
+    let need_new_ctx = loaded
+        .cached_session
+        .as_ref()
+        .map_or(true, |s| s.n_ctx < effective_ctx);
+
+    if need_new_ctx {
+        // Release previous Metal KV buffers first so old and new contexts never coexist
+        loaded.cached_session = None;
+
+        // Pre-allocate up to min(n_ctx_limit, 32768) right from Turn 1 (since
+        // `compute_gpu_budget` already reserved the KV headroom for `n_ctx_limit`),
+        // avoiding repeated mid-session context teardown + full re-prefill as
+        // coding-agent prompts grow from 2k -> 14k -> 24k tokens.
+        let alloc_ctx = effective_ctx
+            .saturating_add(4096)
+            .max(n_ctx_limit.min(32768))
+            .min(n_ctx_limit)
+            .max(effective_ctx);
+
+        let ctx = create_loaded_context(
+            loaded,
+            alloc_ctx,
+            n_batch,
+            default_ubatch,
+            n_threads,
+            op_offload,
         )?;
-        // Immediately convert back to avoid leak — the PrefetchState is kept alive
-        // by the Arc in LoadedModel, not by this raw pointer.
-        unsafe {
-            Arc::from_raw(state_ptr as *const PrefetchState);
-        }
-        ctx
-    } else {
-        LlamaContext::new_with_callback_and_kv(
-            &loaded.model,
-            effective_ctx,
-            config.n_batch,
-            config.n_threads,
-            None,
-            std::ptr::null_mut(),
-            loaded.kv_quantization,
-        )?
-    };
+
+        loaded.cached_session = Some(CachedSession {
+            ctx,
+            n_ctx: alloc_ctx,
+            tokens: Vec::new(),
+            checkpoints: Vec::new(),
+        });
+    }
 
     let mut sampler = LlamaSampler::new(sampling);
 
     // Prefetch NVMe layers before prompt eval
     if let Some(ref state) = loaded.prefetch_state {
-        state.prefetch_all_nvme();
+        if !state.expert_streaming.load(std::sync::atomic::Ordering::Relaxed)
+            && !state.dense_ffn_streaming.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            state.prefetch_all_nvme();
+        }
     }
 
     // Process prompt (ensure prompt fits within effective context minus generation headroom)
@@ -514,81 +982,318 @@ pub fn generate_from_loaded(
         &tokens[..]
     };
 
+    let n_swa = loaded.model.n_swa();
+
+    // Reuse longest valid common token prefix already present in KV memory,
+    // leaving at least 1 token to decode so logits are freshly computed for sampling.
+    let mut reused_len = {
+        let session = loaded.cached_session.as_mut().unwrap();
+        let common_len = session
+            .tokens
+            .iter()
+            .zip(eval_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let desired_reuse = common_len.min(eval_tokens.len().saturating_sub(1));
+        let kept = session.ctx.trim_kv_to_prefix(desired_reuse, n_swa);
+        session.tokens.truncate(kept);
+        kept
+    };
+
+    // If live KV memory could not be partially rolled back (common on hybrid SSM / recurrent
+    // architectures like Qwen 3.5/3.8 or Gemma 4, where `llama_memory_recurrent` rejects `seq_rm`),
+    // check if a saved checkpoint matches an exact prefix of `eval_tokens`.
+    if reused_len == 0 {
+        let session = loaded.cached_session.as_mut().unwrap();
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in session.checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_tokens.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        if let Some(idx) = best_idx {
+            let cp = session.checkpoints[idx].clone();
+            session.ctx.clear_memory();
+            match session.ctx.load_state_from_memory(&cp.state_bytes) {
+                Ok(()) => {
+                    session.tokens = cp.tokens.clone();
+                    reused_len = best_len;
+                    tracing::info!(
+                        "Restored sequence state checkpoint #{}/{} (reused {}/{} prefix tokens in <1ms without re-prefill)",
+                        idx + 1,
+                        session.checkpoints.len(),
+                        reused_len,
+                        eval_tokens.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to restore sequence state checkpoint: {e}; clearing context");
+                    session.ctx.clear_memory();
+                    session.tokens.clear();
+                }
+            }
+        }
+    }
+
+    let tokens_to_decode = eval_tokens.len().saturating_sub(reused_len);
+    let session_n_ctx = loaded.cached_session.as_ref().map(|s| s.n_ctx).unwrap_or(effective_ctx);
+    tracing::info!(
+        "Prefilling {} prompt tokens (reused {}/{} cached prefix tokens, ctx={}, batch={}, ubatch={}, threads={}, op_offload={})...",
+        tokens_to_decode,
+        reused_len,
+        eval_tokens.len(),
+        session_n_ctx,
+        n_batch,
+        default_ubatch,
+        n_threads,
+        op_offload
+    );
+
     let prompt_start = Instant::now();
-    let batch_size = config.n_batch as usize;
-    for chunk in eval_tokens.chunks(batch_size) {
-        ctx.decode(chunk)?;
+    let batch_size = n_batch as usize;
+    let mut prefill_err: Option<anyhow::Error> = None;
+    {
+        let session = loaded.cached_session.as_mut().unwrap();
+        let mut decoded_so_far = 0usize;
+        for chunk in eval_tokens[reused_len..].chunks(batch_size) {
+            if token_tx.is_closed() {
+                tracing::info!("Client disconnected during prompt prefill; aborting generation");
+                anyhow::bail!("Generation cancelled: client disconnected");
+            }
+            let chunk_start = Instant::now();
+            if let Err(e) = session.ctx.decode(chunk) {
+                prefill_err = Some(e);
+                break;
+            }
+            session.tokens.extend_from_slice(chunk);
+            decoded_so_far += chunk.len();
+            if tokens_to_decode > batch_size {
+                let chunk_secs = chunk_start.elapsed().as_secs_f64().max(1e-6);
+                let total_secs = prompt_start.elapsed().as_secs_f64().max(1e-6);
+                tracing::info!(
+                    "Prefill progress: {}/{} tokens (chunk {:.1} tok/s, avg {:.1} tok/s, {:.1}s elapsed)",
+                    decoded_so_far,
+                    tokens_to_decode,
+                    chunk.len() as f64 / chunk_secs,
+                    decoded_so_far as f64 / total_secs,
+                    total_secs
+                );
+            }
+        }
+    }
+
+    // Snapshot the evaluated prompt state so subsequent conversational turns
+    // can restore this exact prefix state without re-prefilling from token 0.
+    if prefill_err.is_none() && tokens_to_decode > 0 {
+        let session = loaded.cached_session.as_mut().unwrap();
+        match session.ctx.save_state_to_memory() {
+            Ok(bytes) => {
+                let snap = StateCheckpoint {
+                    tokens: eval_tokens.to_vec(),
+                    state_bytes: Arc::new(bytes),
+                };
+                // Bound checkpoint cache to 4 turns to conserve memory
+                if session.checkpoints.len() >= 4 {
+                    session.checkpoints.remove(0);
+                }
+                session.checkpoints.push(snap);
+                tracing::debug!(
+                    "Saved state checkpoint for {} tokens ({} checkpoints in cache)",
+                    eval_tokens.len(),
+                    session.checkpoints.len()
+                );
+            }
+            Err(e) => {
+                tracing::debug!("Could not save state checkpoint: {e}");
+            }
+        }
+    }
+
+    if let Some(first_err) = prefill_err {
+        // Destroy poisoned LlamaContext immediately (`ggml-metal` latches `ctx->has_error = true`
+        // after any command buffer failure and requires recreating the backend to recover).
+        loaded.cached_session = None;
+
+        let is_oom_code = first_err.to_string().contains("-3");
+        if !token_tx.is_closed() && is_oom_code && default_ubatch > 128 {
+            let fallback_batch = n_batch.min(128);
+            tracing::warn!(
+                "Metal command buffer OOM during prompt prefill ({first_err}); recreating backend with conservative batch=128 and retrying once..."
+            );
+            let retry_ctx = create_loaded_context(
+                loaded,
+                effective_ctx,
+                fallback_batch,
+                fallback_batch,
+                n_threads,
+                false,
+            )?;
+            loaded.cached_session = Some(CachedSession {
+                ctx: retry_ctx,
+                n_ctx: effective_ctx,
+                tokens: Vec::new(),
+                checkpoints: Vec::new(),
+            });
+            let session = loaded.cached_session.as_mut().unwrap();
+            for chunk in eval_tokens.chunks(fallback_batch as usize) {
+                if token_tx.is_closed() {
+                    anyhow::bail!("Generation cancelled: client disconnected");
+                }
+                if let Err(retry_err) = session.ctx.decode(chunk) {
+                    loaded.cached_session = None;
+                    return Err(retry_err);
+                }
+                session.tokens.extend_from_slice(chunk);
+            }
+        } else {
+            return Err(first_err);
+        }
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+    let prefill_tps = if prompt_ms > 0.0 {
+        (tokens_to_decode as f64) / (prompt_ms / 1000.0)
+    } else {
+        0.0
+    };
+    tracing::info!(
+        "Prompt prefill complete: {} tokens in {:.2}s ({:.1} tok/s); starting token generation (max_tokens={})...",
+        tokens_to_decode,
+        prompt_ms / 1000.0,
+        prefill_tps,
+        sampling.max_tokens
+    );
 
-    // Generation loop
-    let mut generated_text = String::new();
-    let mut n_generated: u32 = 0;
-    let gen_start = Instant::now();
-
-    for _ in 0..sampling.max_tokens {
-        let token_id = sampler.sample(&mut ctx, -1);
-        let is_eog = loaded.model.is_eog(token_id);
-        let is_control = loaded.model.is_control(token_id);
-        let piece = loaded.model.token_to_piece(token_id);
-
-        n_generated += 1;
-        generated_text.push_str(&piece);
-
-        let elapsed = gen_start.elapsed().as_secs_f64();
-        let tok_per_sec = if elapsed > 0.0 {
-            n_generated as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        telemetry.emit(TelemetryEvent::TokenGenerated {
-            tok_per_sec,
-            token: piece.clone(),
-        });
-
-        if token_tx
-            .send(GeneratedToken {
-                text: piece.clone(),
-                token_id,
-                tok_per_sec,
-                is_eog,
-            })
-            .is_err()
-        {
-            break;
-        }
-
-        if is_eog {
-            break;
-        }
-
-        if is_control
-            && (piece.contains("end")
-                || piece.contains("im_end")
-                || piece.contains("eot")
-                || piece.contains("stop")
-                || piece.contains("start_of_role")
-                || piece.contains("im_start")
-                || piece.contains("INST"))
-        {
-            break;
-        }
-
-        if should_stop_early(&generated_text, &sampling.stop_sequences) {
-            break;
-        }
-
-        ctx.decode(&[token_id])?;
+    if token_tx.is_closed() {
+        tracing::info!("Client disconnected after prompt prefill; aborting generation");
+        anyhow::bail!("Generation cancelled: client disconnected");
     }
 
-    let perf = ctx.perf();
+    // Generation loop
+    let mut generated_text = if prompt.ends_with("<think>\n") {
+        "<think>\n".to_string()
+    } else {
+        String::new()
+    };
+    let mut n_generated: u32 = 0;
+    let gen_start = Instant::now();
+    let mut decode_err: Option<anyhow::Error> = None;
+
+    {
+        let session = loaded.cached_session.as_mut().unwrap();
+        for _ in 0..sampling.max_tokens {
+            let token_id = sampler.sample(&mut session.ctx, -1);
+            let is_eog = loaded.model.is_eog(token_id);
+            let is_control = loaded.model.is_control(token_id);
+            let piece = loaded.model.token_to_piece(token_id);
+
+            n_generated += 1;
+            generated_text.push_str(&piece);
+
+            let elapsed = gen_start.elapsed().as_secs_f64();
+            let tok_per_sec = if elapsed > 0.0 {
+                n_generated as f64 / elapsed
+            } else {
+                0.0
+            };
+
+            if n_generated == 1 || n_generated % 32 == 0 {
+                let tail_preview: String = generated_text
+                    .chars()
+                    .rev()
+                    .take(80)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                tracing::info!(
+                    "Generating token #{}: {:.1} tok/s ({:.1}s elapsed) — tail: {:?}",
+                    n_generated,
+                    tok_per_sec,
+                    elapsed,
+                    tail_preview
+                );
+            }
+
+            telemetry.emit(TelemetryEvent::TokenGenerated {
+                tok_per_sec,
+                token: piece.clone(),
+            });
+
+            if token_tx
+                .send(GeneratedToken {
+                    text: piece.clone(),
+                    token_id,
+                    tok_per_sec,
+                    is_eog,
+                })
+                .is_err()
+            {
+                tracing::info!(
+                    "Client closed stream after {} generated tokens ({:.1}s); stopping generation",
+                    n_generated,
+                    elapsed
+                );
+                break;
+            }
+
+            if is_eog {
+                break;
+            }
+
+            if is_control
+                && (piece.contains("end")
+                    || piece.contains("im_end")
+                    || piece.contains("eot")
+                    || piece.contains("stop")
+                    || piece.contains("start_of_role")
+                    || piece.contains("im_start")
+                    || piece.contains("INST"))
+            {
+                break;
+            }
+
+            if should_stop_early(&generated_text, &sampling.stop_sequences) {
+                break;
+            }
+
+            if let Err(e) = session.ctx.decode(&[token_id]) {
+                decode_err = Some(e);
+                break;
+            }
+            session.tokens.push(token_id);
+        }
+    }
+
+    if let Some(e) = decode_err {
+        // Destroy poisoned LlamaContext so the next request gets a fresh Metal backend
+        loaded.cached_session = None;
+        return Err(e);
+    }
+
+    let perf = loaded.cached_session.as_ref().unwrap().ctx.perf();
     let total_gen_time = gen_start.elapsed().as_secs_f64();
     let avg_tps = if total_gen_time > 0.0 {
         n_generated as f64 / total_gen_time
     } else {
         0.0
     };
+    let summary_preview: String = generated_text.chars().take(160).collect();
+    tracing::info!(
+        "Generation finished: {} tokens in {:.2}s ({:.1} tok/s, prefill {:.2}s) — start: {:?}",
+        n_generated,
+        total_gen_time,
+        avg_tps,
+        prompt_ms / 1000.0,
+        summary_preview
+    );
 
     Ok(GenerationResult {
         text: generated_text,
@@ -611,7 +1316,7 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
     let arch_lower = metadata.architecture.to_lowercase();
     let is_mla = arch_lower.contains("glm4moe") || arch_lower.contains("deepseek2") || arch_lower.contains("deepseek3");
 
-    let kv_on_gpu = if is_mla {
+    let raw_kv_on_gpu = if is_mla {
         // 576 bytes per layer * Q8_0 (1 byte/elem) * layers * context
         576 * metadata.num_layers as u64 * context_length as u64
     } else {
@@ -627,19 +1332,41 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
             * context_length as u64
     };
 
-    // Reserve headroom for Metal compute graph splits (150+ splits on dense models), SSM recurrent state buffers, and display compositor
-    let is_ssm_hybrid = arch_lower.contains("gemma")
+    let is_linear_attn_hybrid = arch_lower.contains("qwen35")
+        || arch_lower.contains("qwen3next")
+        || arch_lower.contains("nemotron_h")
+        || arch_lower.contains("falcon-h1")
+        || arch_lower.contains("granitehybrid")
+        || arch_lower.contains("plamo2")
         || arch_lower.contains("delta")
         || arch_lower.contains("mamba")
         || arch_lower.contains("rwkv")
         || arch_lower.contains("jamba");
 
-    let runtime_overhead: u64 = if is_ssm_hybrid {
-        // Gated Delta Net and recurrent state buffers create substantial Metal intermediate allocations
-        5800 * 1024 * 1024 // 5.8 GB safety buffer on unified memory
-    } else if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
-        // On 24 GB machines, macOS WindowServer + system memory pressure requires 4.8 GB safety buffer
-        4800 * 1024 * 1024
+    // Scale GPU KV reservation by the auto-selected KV cache quantization (Q4_0 / Q8_0),
+    // matching compute_tier_capacities and compute_kv_cache_plan in placement.rs.
+    let kv_scale = if is_mla {
+        1.0 // already compressed above
+    } else if context_length >= 32768 || raw_kv_on_gpu > (4u64 << 30) {
+        0.28 // Q4_0
+    } else if context_length >= 16384 || raw_kv_on_gpu > (500 * (1 << 20)) {
+        0.53 // Q8_0
+    } else {
+        1.0 // F16
+    };
+    // Linear-attention / Mamba hybrids (e.g. Qwen 3.5/3.8 with full_attention_interval=4,
+    // Nemotron-H) only allocate KV cache on ~1/4 of layers plus ~160 MiB of fixed R/S state.
+    let kv_on_gpu = if is_linear_attn_hybrid {
+        ((raw_kv_on_gpu as f64 * kv_scale * 0.28) as u64) + 160 * 1024 * 1024
+    } else {
+        (raw_kv_on_gpu as f64 * kv_scale) as u64
+    };
+
+    let runtime_overhead: u64 = if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
+        // On 24 GB machines, reserve 3.6 GB below recommendedMaxWorkingSetSize (~19.1 GB) for
+        // Metal compute buffers + safety margin, allowing all 65 repeating layers (14.06 GiB)
+        // of Qwen 3.8 27B onto Metal while keeping tied token_embd.weight (1.59 GiB) on CPU.
+        3600 * 1024 * 1024
     } else {
         3800 * 1024 * 1024
     };
@@ -677,7 +1404,7 @@ pub fn gpu_layers_from_placement(
     let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
     let dense_ffn_streaming = plan.inference_mode == InferenceMode::DenseFfnStreaming;
     let mut max_layer: i32 = -1;
-    let mut first_non_gpu_layer: Option<u32> = None;
+    let mut first_nvme_layer: Option<u32> = None;
 
     // Compute per-layer sizes (excluding streamed tensors from GPU budget)
     let mut layer_sizes: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
@@ -702,8 +1429,8 @@ pub fn gpu_layers_from_placement(
             }
 
             *layer_sizes.entry(layer_idx).or_default() += t.size_bytes;
-            if plan.tier_assignments.get(&t.name) != Some(&StorageTier::Gpu) {
-                first_non_gpu_layer = Some(match first_non_gpu_layer {
+            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
+                first_nvme_layer = Some(match first_nvme_layer {
                     Some(existing) => existing.min(layer_idx),
                     None => layer_idx,
                 });
@@ -715,33 +1442,47 @@ pub fn gpu_layers_from_placement(
         return 0;
     }
 
-    // Cap by plan cutoff (first layer with non-GPU tensors stays on CPU)
-    let from_plan = match first_non_gpu_layer {
-        Some(non_gpu_start) => non_gpu_start as i32,
+    // Cap by NVMe cutoff (layers with NVMe tensors must stay on CPU)
+    let from_plan = match first_nvme_layer {
+        Some(nvme_start) => nvme_start as i32,
         None => max_layer + 1 + 1,
     };
 
-    // Cap by GPU working set: sum layers until budget exhausted.
+    let total_layer_bytes: u64 = layer_sizes.values().sum();
     let non_layer_gpu_size: u64 = gguf
         .tensors
         .iter()
         .filter(|t| t.layer_index.is_none())
         .map(|t| t.size_bytes)
         .sum();
-    let mut cumulative: u64 = non_layer_gpu_size;
-    let mut max_fitting: i32 = 0;
-    for (&layer_idx, &size) in &layer_sizes {
-        cumulative += size;
-        if cumulative <= gpu_budget_bytes {
-            max_fitting = layer_idx as i32 + 1;
+
+    // If all repeating layers + non-layer tensors fit in the GPU budget, offload everything (+1 for output).
+    if total_layer_bytes.saturating_add(non_layer_gpu_size) <= gpu_budget_bytes {
+        return from_plan.min(max_layer + 1 + 1);
+    }
+
+    // Partial GPU offload: `select_partial_offload_strategy` (`MmapWithCpuOutputOverride`) keeps
+    // `output.weight`, `output_norm.weight`, and `token_embd.weight` on CPU so they consume 0 bytes
+    // of Metal buffer memory. Sum repeating layers from the top (`max_layer` down to `0`, matching
+    // `llama.cpp`'s `i_gpu_start..=max_layer` assignment order) up to `gpu_budget_bytes`.
+    let mut cumulative: u64 = 0;
+    let mut fitting_repeating: i32 = 0;
+    for (&_layer_idx, &size) in layer_sizes.iter().rev() {
+        if cumulative.saturating_add(size) <= gpu_budget_bytes {
+            cumulative += size;
+            fitting_repeating += 1;
         } else {
             break;
         }
     }
-    let from_capacity = if max_fitting == max_layer + 1 {
-        max_fitting + 1
+
+    // In `llama.cpp`, `n_gpu_layers` includes the output slot (`i_gpu_start = num_layers + 1 - ngl`),
+    // so `fitting_repeating + 1` offloads `fitting_repeating` repeating layers while our CPU buffer
+    // override keeps the non-fitting output / tied-embedding tensor on CPU.
+    let from_capacity = if fitting_repeating > 0 {
+        (fitting_repeating + 1).min(max_layer + 2)
     } else {
-        max_fitting
+        0
     };
 
     from_plan.min(from_capacity)
@@ -777,7 +1518,11 @@ pub fn generate_blocking(
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
 
     // Generation loop
-    let mut generated_text = String::new();
+    let mut generated_text = if prompt.ends_with("<think>\n") {
+        "<think>\n".to_string()
+    } else {
+        String::new()
+    };
     let mut n_generated: u32 = 0;
     let gen_start = Instant::now();
 
@@ -869,13 +1614,23 @@ pub fn generate_with_nvme_scheduling(
     let _backend = LlamaBackend::init();
 
     // Check if there are any NVMe tensors
-    let has_nvme = plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = !gguf.is_split()
+        && plan
+            .tier_assignments
+            .values()
+            .any(|t| *t == StorageTier::Nvme);
 
     if !has_nvme {
-        return generate_blocking(model_path, prompt, config, n_gpu_layers, token_tx, telemetry);
+        let mut loaded = load_model(model_path, config, n_gpu_layers, plan, gguf)?;
+        return generate_from_loaded(
+            &mut loaded,
+            GenerateFromLoadedParams {
+                prompt,
+                sampling: &config.sampling,
+                token_tx,
+                telemetry,
+            },
+        );
     }
 
     // Create custom buffer type for NVMe-tier tensors
@@ -1552,5 +2307,371 @@ mod tests {
         assert!(should_stop_early("Done.\n### Human:", &custom_stops));
         // Normal text should not stop
         assert!(!should_stop_early("Here are 3 weather stations with the lowest temperature:\n1. Station A", &empty_stops));
+    }
+
+    #[test]
+    fn test_compute_gpu_budget_applies_kv_quantization_at_32k() {
+        use crate::profiler::types::{CpuProfile, GpuBackend, GpuProfile, MemoryProfile, SystemInfo};
+        use chrono::Utc;
+
+        let hw = HardwareProfile {
+            timestamp: Utc::now(),
+            system: SystemInfo {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                machine_model: "Mac16,7".into(),
+                total_cores: 14,
+            },
+            memory: MemoryProfile {
+                total_bytes: 24 * (1 << 30),
+                available_bytes: 20 * (1 << 30),
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                is_unified: true,
+            },
+            gpu: Some(GpuProfile {
+                name: "Apple M4 Pro".into(),
+                vram_bytes: 19069 * 1024 * 1024, // 19069 MiB Metal working set on 24 GB M4 Pro
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                fp16_tflops: 20.0,
+                backend: GpuBackend::Metal,
+            }),
+            storage: vec![],
+            cpu: CpuProfile {
+                model_name: "Apple M4 Pro".into(),
+                cores_performance: 10,
+                cores_efficiency: 4,
+                has_amx: true,
+                has_neon: true,
+                has_avx512: false,
+                has_avx2: false,
+                int8_gflops: 1000.0,
+            },
+        };
+
+        // 26B Gemma-class metadata where unquantized 32k FP16 KV would be ~6.44 GiB
+        let meta = ModelMetadata {
+            architecture: "gemma4".into(),
+            parameter_count: 26_000_000_000,
+            context_length: 131072,
+            embedding_dim: 4096,
+            num_layers: 42,
+            num_heads: 32,
+            num_kv_heads: 16,
+            vocab_size: 262144,
+            quantization: Some("Q4_K_M".into()),
+            is_moe: false,
+            num_experts: None,
+            num_experts_used: None,
+        };
+
+        let budget_32k = compute_gpu_budget(&hw, &meta, 32768);
+        // Raw FP16 KV at 32k here is 10.5 GiB, which previously crushed GPU budget down to ~2.4 GiB.
+        // With Q4_0 KV scaling (0.28x -> ~2.94 GiB), GPU budget stays above 9.5 GiB on 24 GB M4 Pro.
+        assert!(
+            budget_32k > (95 * (1 << 30)) / 10,
+            "Expected > 9.5 GiB GPU budget at 32k context with Q4_0 KV, got {} bytes",
+            budget_32k
+        );
+    }
+
+    #[test]
+    fn test_should_stop_early_ignores_tool_tags_inside_thought_blocks() {
+        // Hypothetical </function> and </tool_call> inside unclosed <think> must NOT abort generation
+        let mid_think = "<think>\nShould use <tool_call><function=read_file></function></tool_call> next...";
+        assert!(!should_stop_early(mid_think, &[]));
+
+        // Once </think> closes, tags mentioned INSIDE <think> still must NOT abort before the real call
+        let just_closed_think = "<think>\nShould use <tool_call><function=read_file></function></tool_call></think>\n<tool_call>\n<function=read_file>\n";
+        assert!(!should_stop_early(just_closed_think, &[]));
+
+        // Once the real post-thought </tool_call> closes, stop immediately
+        let finished_call = "<think>\nShould use <function=read_file></function></think>\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n</function>\n</tool_call>";
+        assert!(should_stop_early(finished_call, &[]));
+    }
+
+    #[test]
+    fn test_select_partial_offload_strategy_prevents_whole_file_metal_mmap() {
+        use crate::model::gguf::{GgmlType, TensorInfo};
+
+        // Simulate Qwen 3.8 27B GGUF layout (tied embeddings at offset 0, output_norm right after,
+        // followed by 64 layers of ~260 MiB each = ~17.6 GiB total).
+        let mut tensors = Vec::new();
+        let mut offset = 0u64;
+        let embd_size = 1024 * 1024 * 1024; // 1 GiB
+        tensors.push(TensorInfo {
+            name: "token_embd.weight".into(),
+            dimensions: vec![5120, 151936],
+            dtype: GgmlType::Q4K,
+            offset,
+            size_bytes: embd_size,
+            layer_index: None,
+        });
+        offset += embd_size;
+
+        tensors.push(TensorInfo {
+            name: "output_norm.weight".into(),
+            dimensions: vec![5120],
+            dtype: GgmlType::F32,
+            offset,
+            size_bytes: 20480,
+            layer_index: None,
+        });
+        offset += 20480;
+
+        let layer_bytes = 260 * 1024 * 1024; // 260 MiB
+        for l in 0..64u32 {
+            tensors.push(TensorInfo {
+                name: format!("blk.{l}.ffn_down.weight"),
+                dimensions: vec![5120, 25600],
+                dtype: GgmlType::Q4K,
+                offset,
+                size_bytes: layer_bytes,
+                layer_index: Some(l),
+            });
+            offset += layer_bytes;
+        }
+
+        let gguf = GgufFile {
+            version: 3,
+            metadata: Default::default(),
+            tensors,
+            data_offset: 4096,
+        };
+
+        // Full GPU offload (65 = 64 layers + output) -> standard mmap
+        assert_eq!(
+            select_partial_offload_strategy(&gguf, 65),
+            PartialOffloadStrategy::StandardMmap {
+                all_layers_on_gpu: true
+            }
+        );
+
+        // Partial GPU offload (34/65 layers): without overriding output/tied token_embd onto CPU,
+        // Metal's get_mapping_range would span [0 .. 17.6 GiB] and trigger kIOGPU OOM!
+        assert_eq!(
+            select_partial_offload_strategy(&gguf, 34),
+            PartialOffloadStrategy::MmapWithCpuOutputOverride {
+                override_regex: "^(output_norm\\.weight|token_embd\\.weight)$".into(),
+            }
+        );
+
+        // When `output_norm.weight` is at the end of the file (contiguous with `blk.63`) and only
+        // tied `token_embd.weight` is at offset 0, ONLY `token_embd.weight` is overridden to CPU
+        // so `output_norm.weight` stays on Metal and `CPU_Mapped` does not span the whole file.
+        let mut trailing_norm_gguf = gguf.clone();
+        trailing_norm_gguf.tensors[1].offset = offset;
+        assert_eq!(
+            select_partial_offload_strategy(&trailing_norm_gguf, 34),
+            PartialOffloadStrategy::MmapWithCpuOutputOverride {
+                override_regex: "^(token_embd\\.weight)$".into(),
+            }
+        );
+
+        // Now simulate a wildly interleaved GGUF where >512 MiB of CPU layers sit inside the GPU slice
+        let mut interleaved = gguf.clone();
+        // Swap offsets of blk.0..blk.3 (1.04 GiB of CPU layers) with blk.40..blk.43 (inside GPU slice)
+        for i in 0..4usize {
+            let cpu_idx = 2 + i;
+            let gpu_idx = 2 + 40 + i;
+            let tmp = interleaved.tensors[cpu_idx].offset;
+            interleaved.tensors[cpu_idx].offset = interleaved.tensors[gpu_idx].offset;
+            interleaved.tensors[gpu_idx].offset = tmp;
+        }
+        assert_eq!(
+            select_partial_offload_strategy(&interleaved, 34),
+            PartialOffloadStrategy::NoMmapExactAlloc
+        );
+    }
+
+    #[test]
+    fn test_qwen35_and_nemotron_h_use_ssm_hybrid_overhead() {
+        use crate::profiler::types::{CpuProfile, GpuBackend, GpuProfile, MemoryProfile, SystemInfo};
+        use chrono::Utc;
+
+        let hw = HardwareProfile {
+            timestamp: Utc::now(),
+            system: SystemInfo {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                machine_model: "Mac16,7".into(),
+                total_cores: 14,
+            },
+            memory: MemoryProfile {
+                total_bytes: 24 * (1 << 30),
+                available_bytes: 18 * (1 << 30),
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                is_unified: true,
+            },
+            gpu: Some(GpuProfile {
+                name: "Apple M4 Pro".into(),
+                vram_bytes: 19069 * 1024 * 1024,
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                fp16_tflops: 20.0,
+                backend: GpuBackend::Metal,
+            }),
+            storage: vec![],
+            cpu: CpuProfile {
+                model_name: "Apple M4 Pro".into(),
+                cores_performance: 10,
+                cores_efficiency: 4,
+                has_amx: true,
+                has_neon: true,
+                has_avx512: false,
+                has_avx2: false,
+                int8_gflops: 1000.0,
+            },
+        };
+
+        let make_meta = |arch: &str| ModelMetadata {
+            architecture: arch.into(),
+            parameter_count: 27_000_000_000,
+            context_length: 262144,
+            embedding_dim: 5120,
+            num_layers: 64,
+            num_heads: 24,
+            num_kv_heads: 4,
+            vocab_size: 248320,
+            quantization: Some("Q4_K_M".into()),
+            is_moe: false,
+            num_experts: None,
+            num_experts_used: None,
+        };
+
+        let dense_llama_budget = compute_gpu_budget(&hw, &make_meta("llama"), 32768);
+        let qwen35_budget = compute_gpu_budget(&hw, &make_meta("qwen35"), 32768);
+        let nemotron_h_budget = compute_gpu_budget(&hw, &make_meta("nemotron_h"), 32768);
+
+        // Linear-attention hybrids (`qwen35`, `nemotron_h`) only allocate KV cache on ~1/4 of layers
+        // plus ~160 MiB of fixed R/S state, yielding >1 GiB more GPU weight budget than a 64-layer full-attention model.
+        assert!(qwen35_budget > dense_llama_budget + 1024 * 1024 * 1024);
+        assert_eq!(qwen35_budget, nemotron_h_budget);
+
+        // Verify `gpu_layers_from_placement` does NOT subtract CPU-resident non-layer tensors
+        // (`token_embd.weight` + `output.weight` ≈ 3.8 GiB) during partial offload, allowing ~57/65
+        // repeating layers (`n_gpu_layers = 58`) on Metal GPU instead of 31.
+        let mut tensors = Vec::new();
+        tensors.push(TensorInfo {
+            name: "token_embd.weight".into(),
+            dimensions: vec![5120, 248320],
+            dtype: GgmlType::Q4K,
+            offset: 0,
+            size_bytes: 1900 * 1024 * 1024,
+            layer_index: None,
+        });
+        tensors.push(TensorInfo {
+            name: "output.weight".into(),
+            dimensions: vec![5120, 248320],
+            dtype: GgmlType::Q6K,
+            offset: 1900 * 1024 * 1024,
+            size_bytes: 1900 * 1024 * 1024,
+            layer_index: None,
+        });
+        let mut assignments = HashMap::new();
+        assignments.insert("token_embd.weight".into(), StorageTier::Ram);
+        assignments.insert("output.weight".into(), StorageTier::Ram);
+        for l in 0..65u32 {
+            let name = format!("blk.{l}.ffn_down.weight");
+            tensors.push(TensorInfo {
+                name: name.clone(),
+                dimensions: vec![5120, 25600],
+                dtype: GgmlType::Q4K,
+                offset: (3800 + l as u64 * 221) * 1024 * 1024,
+                size_bytes: 221 * 1024 * 1024,
+                layer_index: Some(l),
+            });
+            assignments.insert(
+                name,
+                if l < 31 { StorageTier::Gpu } else { StorageTier::Ram },
+            );
+        }
+        let gguf = GgufFile {
+            version: 3,
+            metadata: Default::default(),
+            tensors,
+            data_offset: 4096,
+        };
+        let plan = make_plan(assignments);
+        let ngl = gpu_layers_from_placement(&plan, &gguf, qwen35_budget);
+        assert_eq!(
+            ngl, 66,
+            "Expected all 65 repeating layers + output slot (ngl=66) for Qwen 3.8 27B on 24 GB M4 Pro, got {ngl}"
+        );
+        assert_eq!(
+            select_partial_offload_strategy_with_plan(&gguf, ngl, Some(&plan)),
+            PartialOffloadStrategy::MmapWithCpuOutputOverride {
+                override_regex: "^(output\\.weight)$".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_prefix_matching() {
+        let checkpoints = vec![
+            StateCheckpoint {
+                tokens: vec![101, 102, 103, 104],
+                state_bytes: Arc::new(vec![1, 2, 3]),
+            },
+            StateCheckpoint {
+                tokens: vec![101, 102, 103, 104, 201, 202, 203],
+                state_bytes: Arc::new(vec![4, 5, 6]),
+            },
+        ];
+
+        // Case 1: Prompt is an extension of Turn 2 -> matches Turn 2 checkpoint (len=7)
+        let eval_turn3 = vec![101, 102, 103, 104, 201, 202, 203, 301, 302];
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_turn3.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_turn3.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        assert_eq!(best_idx, Some(1));
+        assert_eq!(best_len, 7);
+
+        // Case 2: Prompt branches off Turn 1 -> matches Turn 1 checkpoint (len=4)
+        let eval_branch = vec![101, 102, 103, 104, 999, 1000];
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_branch.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_branch.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        assert_eq!(best_idx, Some(0));
+        assert_eq!(best_len, 4);
+
+        // Case 3: Prompt completely differs -> no checkpoint matches (reused_len = 0)
+        let eval_different = vec![555, 666, 777];
+        let mut best_idx = None;
+        let mut best_len = 0;
+        for (idx, cp) in checkpoints.iter().enumerate() {
+            let mlen = cp
+                .tokens
+                .iter()
+                .zip(eval_different.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if mlen == cp.tokens.len() && mlen < eval_different.len() && mlen > best_len {
+                best_len = mlen;
+                best_idx = Some(idx);
+            }
+        }
+        assert_eq!(best_idx, None);
+        assert_eq!(best_len, 0);
     }
 }

@@ -46,6 +46,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/show", post(show_handler))
         .route("/api/generate", post(generate_handler))
         .route("/api/chat", post(chat_handler))
+        .route("/api/pull", post(pull_handler))
+        .route("/api/delete", axum::routing::delete(delete_handler))
         // OpenAI API (with /v1/ prefix and without /v1/ for clients with custom base_url handling)
         .route("/v1/models", get(v1_models_handler))
         .route("/models", get(v1_models_handler))
@@ -135,6 +137,128 @@ async fn show_handler(
     }
 }
 
+async fn delete_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteRequest>,
+) -> Response {
+    let custom_dir_override = req.models_dir.map(std::path::PathBuf::from);
+    let mut manager = state.manager.lock().unwrap();
+
+    // If active model is being deleted, unload it first
+    if let Some(ref active) = manager.active_model {
+        if active.name.eq_ignore_ascii_case(&req.name)
+            || active.name.to_lowercase().contains(&req.name.to_lowercase())
+        {
+            manager.active_model = None;
+        }
+    }
+
+    let target_dir = custom_dir_override
+        .or_else(|| manager.registry.custom_dir.clone());
+
+    match crate::model::pull::delete_model_files(&req.name, target_dir.as_deref(), &mut manager.registry) {
+        Ok((name, bytes_freed)) => {
+            tracing::info!("Deleted model '{}' (freed {} bytes)", name, bytes_freed);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn pull_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PullRequest>,
+) -> Response {
+    let spec = match crate::model::pull::resolve_pull_spec(&req.name) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let target_models_dir = req
+        .models_dir
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let manager = state.manager.lock().unwrap();
+            manager.registry.custom_dir.clone()
+        })
+        .unwrap_or_else(crate::model::pull::detect_default_models_dir);
+
+    if !req.stream {
+        // Non-streaming: await completion
+        match crate::model::pull::download_model_with_progress(
+            &spec,
+            &target_models_dir,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {
+                let mut manager = state.manager.lock().unwrap();
+                manager.registry.refresh();
+                Json(serde_json::json!({"status": "success"})).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        // Streaming: NDJSON progress chunks
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let state_clone = state.clone();
+        let target_dir_clone = target_models_dir.clone();
+
+        tokio::spawn(async move {
+            let res = crate::model::pull::download_model_with_progress(
+                &spec,
+                &target_dir_clone,
+                false,
+                Some(tx.clone()),
+            )
+            .await;
+
+            if res.is_ok() {
+                let mut manager = state_clone.manager.lock().unwrap();
+                manager.registry.refresh();
+            } else if let Err(e) = res {
+                let _ = tx
+                    .send(crate::server::ollama_types::PullResponseChunk {
+                        status: format!("error: {e}"),
+                        digest: None,
+                        total: None,
+                        completed: None,
+                    })
+                    .await;
+            }
+        });
+
+        let body = streaming::ndjson_pull_stream(rx);
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (header::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
+            body,
+        )
+            .into_response()
+    }
+}
+
 async fn generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateRequest>,
@@ -164,6 +288,10 @@ async fn generate_handler(
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping generate");
+            return;
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -191,7 +319,12 @@ async fn generate_handler(
         );
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/x-ndjson")],
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
@@ -207,6 +340,16 @@ async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> Response {
     let request_start = Instant::now();
+    tracing::info!(
+        "POST /api/chat: model={:?}, stream={}, messages={}, tools={}",
+        req.model,
+        req.stream,
+        req.messages.len(),
+        req.tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .map_or(0, |a| a.len())
+    );
 
     let (loaded, model_name, info) = {
         let mut manager = state.manager.lock().unwrap();
@@ -228,15 +371,36 @@ async fn chat_handler(
     let telemetry = state.telemetry.clone();
     let req_messages = req.messages;
     let req_tools = req.tools;
+    let is_streaming = req.stream;
     let arch = info.architecture.clone();
     let model_req_name = req.model.clone();
     let active_model_name = model_name.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping chat");
+            return;
+        }
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&req_messages, req_tools.as_ref(), Some(&full_hint));
+        if !is_streaming && prompt.len() > 12000 {
+            let estimated_tokens = prompt.len() / 4;
+            tracing::warn!(
+                "Non-streaming request received with large prompt (~{} tokens, {} chars); prefill may take 60-120s. Ensure client socket read timeout is >= 300s.",
+                estimated_tokens,
+                prompt.len()
+            );
+        }
+        if prompt.ends_with("<think>\n") {
+            let _ = token_tx.send(crate::compute::inference::GeneratedToken {
+                text: "<think>\n".into(),
+                token_id: 0,
+                tok_per_sec: 0.0,
+                is_eog: false,
+            });
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -259,7 +423,12 @@ async fn chat_handler(
             streaming::ndjson_chat_stream(model_name, token_rx, result_rx, request_start, 0);
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/x-ndjson")],
+            [
+                (header::CONTENT_TYPE, "application/x-ndjson"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
@@ -359,6 +528,7 @@ async fn collect_chat(
             role: "assistant".into(),
             content,
             tool_calls,
+            ..Default::default()
         },
         done: true,
         done_reason: Some("stop".into()),
@@ -424,6 +594,17 @@ async fn v1_chat_completions_handler(
     Json(req): Json<OpenAIChatCompletionRequest>,
 ) -> Response {
     let _request_start = Instant::now();
+    tracing::info!(
+        "POST /v1/chat/completions: model={:?}, stream={}, messages={}, tools={}, max_tokens={:?}",
+        req.model,
+        req.stream,
+        req.messages.len(),
+        req.tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .map_or(0, |a| a.len()),
+        req.max_tokens
+    );
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -470,16 +651,15 @@ async fn v1_chat_completions_handler(
         sampling.repeat_penalty = rp;
     }
 
-    // Convert OpenAIChatMessage to internal ChatMessage
-    let internal_messages: Vec<ChatMessage> = req
-        .messages
-        .into_iter()
-        .map(|m| ChatMessage {
-            role: m.role,
-            content: m.content.unwrap_or_default(),
-            tool_calls: m.tool_calls.map(|tcs| {
-                tcs.into_iter()
-                    .map(|tc| ToolCall {
+    // Convert OpenAIChatMessage to internal ChatMessage while resolving tool_call_id -> function name
+    let mut id_to_tool_name = std::collections::HashMap::<String, String>::new();
+    let mut internal_messages = Vec::with_capacity(req.messages.len());
+    for m in req.messages {
+        let converted_calls = m.tool_calls.map(|tcs| {
+            tcs.into_iter()
+                .map(|tc| {
+                    id_to_tool_name.insert(tc.id.clone(), tc.function.name.clone());
+                    ToolCall {
                         id: Some(tc.id),
                         call_type: Some(tc.call_type),
                         function: FunctionCall {
@@ -487,25 +667,63 @@ async fn v1_chat_completions_handler(
                             arguments: serde_json::from_str(&tc.function.arguments)
                                 .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments)),
                         },
-                    })
-                    .collect()
-            }),
-        })
-        .collect();
+                    }
+                })
+                .collect()
+        });
+        let resolved_tool_name = m.name.or_else(|| {
+            m.tool_call_id
+                .as_ref()
+                .and_then(|cid| id_to_tool_name.get(cid).cloned())
+        });
+        internal_messages.push(ChatMessage {
+            role: m.role,
+            content: m.content.unwrap_or_default(),
+            tool_calls: converted_calls,
+            tool_call_id: m.tool_call_id,
+            tool_name: resolved_tool_name,
+        });
+    }
 
     let (token_tx, token_rx) = mpsc::unbounded_channel();
     let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
     let telemetry = state.telemetry.clone();
-    let req_tools = req.tools;
+    let tools_disabled = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| s.eq_ignore_ascii_case("none"));
+    let req_tools = if tools_disabled { None } else { req.tools };
+    let is_streaming = req.stream;
     let arch = info.architecture.clone();
     let model_req_name = req.model.clone();
     let active_model_name = model_name.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping OpenAI chat");
+            return;
+        }
         let tmpl = model.model.chat_template().unwrap_or_default();
         let full_hint = format!("{} {} {} {}", arch, active_model_name, model_req_name, tmpl);
         let prompt = format_chat_prompt(&internal_messages, req_tools.as_ref(), Some(&full_hint));
+        if !is_streaming && prompt.len() > 12000 {
+            let estimated_tokens = prompt.len() / 4;
+            tracing::warn!(
+                "Non-streaming request received with large prompt (~{} tokens, {} chars); prefill may take 60-120s. Ensure client socket read timeout is >= 300s.",
+                estimated_tokens,
+                prompt.len()
+            );
+        }
+        if prompt.ends_with("<think>\n") {
+            let _ = token_tx.send(crate::compute::inference::GeneratedToken {
+                text: "<think>\n".into(),
+                token_id: 0,
+                tok_per_sec: 0.0,
+                is_eog: false,
+            });
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -533,7 +751,12 @@ async fn v1_chat_completions_handler(
         );
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/event-stream")],
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()
@@ -546,19 +769,30 @@ async fn v1_chat_completions_handler(
         let result = result_rx.await.ok();
         let (content, tool_calls) = crate::server::chat::parse_tool_calls(&full_response);
 
-        let openai_tool_calls = tool_calls.map(|tcs| {
+        let openai_tool_calls: Option<Vec<OpenAIToolCall>> = tool_calls.map(|tcs| {
             tcs.into_iter()
-                .enumerate()
-                .map(|(i, tc)| OpenAIToolCall {
-                    id: tc.id.unwrap_or_else(|| format!("call_{}_{}", chat_id, i)),
+                .map(|tc| OpenAIToolCall {
+                    index: None,
+                    id: tc
+                        .id
+                        .unwrap_or_else(crate::server::chat::generate_tool_call_id),
                     call_type: "function".into(),
                     function: OpenAIFunctionCall {
                         name: tc.function.name,
-                        arguments: serde_json::to_string(&tc.function.arguments).unwrap_or_default(),
+                        arguments: serde_json::to_string(&tc.function.arguments)
+                            .unwrap_or_else(|_| "{}".into()),
                     },
                 })
                 .collect()
         });
+
+        let has_tool_calls = openai_tool_calls.is_some();
+        let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+        let message_content = if has_tool_calls && content.is_empty() {
+            None
+        } else {
+            Some(content)
+        };
 
         let prompt_tokens = result.as_ref().map(|r| r.prompt_tokens).unwrap_or(0);
         let completion_tokens = result.as_ref().map(|r| r.tokens_generated).unwrap_or(0);
@@ -572,11 +806,12 @@ async fn v1_chat_completions_handler(
                 index: 0,
                 message: OpenAIChatMessage {
                     role: "assistant".into(),
-                    content: Some(content),
+                    content: message_content,
+                    name: None,
                     tool_calls: openai_tool_calls,
                     tool_call_id: None,
                 },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(finish_reason.into()),
             }],
             usage: OpenAIUsage {
                 prompt_tokens,
@@ -641,6 +876,10 @@ async fn v1_completions_handler(
 
     tokio::task::spawn_blocking(move || {
         let mut model = loaded.lock().unwrap();
+        if token_tx.is_closed() {
+            tracing::info!("Client disconnected while waiting for model lock; skipping OpenAI completion");
+            return;
+        }
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
             sampling: &sampling,
@@ -668,7 +907,12 @@ async fn v1_completions_handler(
         );
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/event-stream")],
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CONNECTION, "keep-alive"),
+                (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+            ],
             body,
         )
             .into_response()

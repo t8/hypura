@@ -70,19 +70,51 @@ impl ModelRegistry {
         registry
     }
 
+    /// Set or override the custom models directory at runtime and refresh.
+    pub fn set_custom_dir(&mut self, dir: Option<PathBuf>) {
+        self.custom_dir = dir;
+        self.refresh();
+    }
+
     /// Refresh and scan all directories for models.
     pub fn refresh(&mut self) {
         self.models.clear();
 
-        // 1. Scan custom directory (if specified)
-        let custom_dir = self.custom_dir.clone();
+        // 1. Scan custom directory (if specified, or fallback to environment/default)
+        let custom_dir = self.custom_dir.clone().or_else(|| {
+            if let Ok(env_val) = std::env::var("HYPURA_MODELS_DIR") {
+                let p = PathBuf::from(env_val);
+                if p.is_dir() {
+                    return Some(p);
+                }
+            }
+            let realtek = PathBuf::from("/Volumes/RealtekData/models");
+            if realtek.is_dir() {
+                return Some(realtek);
+            }
+            None
+        });
+
         if let Some(ref dir) = custom_dir {
-            self.scan_directory(dir, "Custom");
+            if dir.join("manifests").exists() && dir.join("blobs").exists() {
+                self.scan_ollama_models(dir);
+            } else {
+                self.scan_directory(dir, "Custom");
+            }
         }
 
-        // 2. Scan current working directory for *.gguf
+        // 2. Scan current working directory for *.gguf ONLY if not home or root
         if let Ok(cwd) = std::env::current_dir() {
-            self.scan_directory(&cwd, "Local");
+            let is_home_or_root = if let Ok(home) = std::env::var("HOME") {
+                let home_path = PathBuf::from(home);
+                cwd == home_path || cwd == Path::new("/") || cwd.starts_with(home_path.join("Library"))
+            } else {
+                cwd == Path::new("/")
+            };
+
+            if !is_home_or_root {
+                self.scan_directory(&cwd, "Local");
+            }
         }
 
         // 3. Scan Ollama models directory
@@ -92,13 +124,24 @@ impl ModelRegistry {
         }
     }
 
-    /// Scan a directory for GGUF files.
+    /// Scan a directory for GGUF files (recursively up to depth 4).
     fn scan_directory(&mut self, dir: &Path, source_label: &str) {
-        if !dir.is_dir() {
+        self.scan_directory_recursive(dir, dir, source_label, 0, 4);
+    }
+
+    fn scan_directory_recursive(
+        &mut self,
+        root_dir: &Path,
+        current_dir: &Path,
+        source_label: &str,
+        depth: usize,
+        max_depth: usize,
+    ) {
+        if !current_dir.is_dir() || depth > max_depth {
             return;
         }
 
-        let entries = match fs::read_dir(dir) {
+        let entries = match fs::read_dir(current_dir) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -108,10 +151,58 @@ impl ModelRegistry {
             if path.is_file() || path.is_symlink() {
                 if let Some(ext) = path.extension() {
                     if ext == "gguf" {
+                        let stem = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+
+                        // For multi-part sharded models, skip non-first shards (00002-of-*, etc.)
+                        if is_non_first_shard(&stem) {
+                            continue;
+                        }
+
                         if let Some(model) = self.inspect_gguf_file(&path, source_label) {
-                            self.models.insert(model.name.clone(), model);
+                            // 1. Primary key: exact filename stem
+                            self.models.insert(model.name.clone(), model.clone());
+
+                            // 2. Base stem without shard suffix (e.g. Qwen3.8-Flash-Next-UD-IQ3_XXS)
+                            if let Some(pos) = stem.find("-00001-of-") {
+                                let base_stem = stem[..pos].to_string();
+                                self.models.entry(base_stem).or_insert_with(|| model.clone());
+                            }
+
+                            // 3. Parent directory aliases (e.g. "qwen3.8-flash-next", "UD-IQ3_XXS")
+                            let mut parent = current_dir;
+                            while parent != root_dir {
+                                if let Some(folder_name) = parent.file_name() {
+                                    let folder_str = folder_name.to_string_lossy().to_string();
+                                    self.models.entry(folder_str).or_insert_with(|| model.clone());
+                                }
+                                if let Some(p) = parent.parent() {
+                                    parent = p;
+                                } else {
+                                    break;
+                                }
+                            }
                         }
                     }
+                }
+            } else if path.is_dir() && depth < max_depth {
+                let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                // Skip hidden directories and macOS TCC-protected directories to prevent permission popups
+                let is_protected_or_hidden = name.starts_with('.')
+                    || name.eq_ignore_ascii_case("Music")
+                    || name.eq_ignore_ascii_case("Pictures")
+                    || name.eq_ignore_ascii_case("Movies")
+                    || name.eq_ignore_ascii_case("Library")
+                    || name.eq_ignore_ascii_case("Desktop")
+                    || name.eq_ignore_ascii_case("Documents")
+                    || name.eq_ignore_ascii_case("Downloads")
+                    || name.ends_with(".photoslibrary")
+                    || name.eq_ignore_ascii_case(".Trash");
+
+                if !is_protected_or_hidden {
+                    self.scan_directory_recursive(root_dir, &path, source_label, depth + 1, max_depth);
                 }
             }
         }
@@ -152,7 +243,7 @@ impl ModelRegistry {
 
     /// Read GGUF header to extract metadata.
     fn inspect_gguf_file(&self, path: &Path, source_label: &str) -> Option<RegisteredModel> {
-        let file_size = fs::metadata(path).ok()?.len();
+        let file_size = compute_total_shard_size(path);
         let gguf = GgufFile::open(path).ok()?;
         let metadata = ModelMetadata::from_gguf(&gguf).ok()?;
 
@@ -345,6 +436,47 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Check if a GGUF filename stem is a non-first shard (e.g. `*-00002-of-00004`).
+pub fn is_non_first_shard(stem: &str) -> bool {
+    if let Some(pos) = stem.find("-of-") {
+        let prefix = &stem[..pos];
+        if let Some(dash) = prefix.rfind('-') {
+            let shard_num_str = &prefix[dash + 1..];
+            if let Ok(num) = shard_num_str.parse::<u32>() {
+                return num > 1;
+            }
+        }
+    }
+    false
+}
+
+/// Compute total size of all shards if this is the first shard of a multi-file model.
+pub fn compute_total_shard_size(path: &Path) -> u64 {
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+    };
+    if let Some(pos) = stem.find("-00001-of-") {
+        let base_prefix = &stem[..pos];
+        let total_str = &stem[pos + "-00001-of-".len()..];
+        if let Ok(total_shards) = total_str.parse::<u32>() {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let mut total_bytes = 0u64;
+            for shard_idx in 1..=total_shards {
+                let shard_name = format!("{}-{:05}-of-{:05}.gguf", base_prefix, shard_idx, total_shards);
+                let shard_path = parent.join(shard_name);
+                if let Ok(meta) = fs::metadata(shard_path) {
+                    total_bytes += meta.len();
+                }
+            }
+            if total_bytes > 0 {
+                return total_bytes;
+            }
+        }
+    }
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
 fn format_parameter_size(params: u64) -> String {
     if params >= 1_000_000_000 {
         format!("{:.1}B", params as f64 / 1e9)
@@ -364,5 +496,14 @@ mod tests {
         assert_eq!(format_parameter_size(24_000_000_000), "24.0B");
         assert_eq!(format_parameter_size(1_500_000_000), "1.5B");
         assert_eq!(format_parameter_size(500_000_000), "500M");
+    }
+
+    #[test]
+    fn test_is_non_first_shard() {
+        assert!(!is_non_first_shard("model-00001-of-00004"));
+        assert!(is_non_first_shard("model-00002-of-00004"));
+        assert!(is_non_first_shard("model-00003-of-00004"));
+        assert!(is_non_first_shard("model-00004-of-00004"));
+        assert!(!is_non_first_shard("single-model"));
     }
 }

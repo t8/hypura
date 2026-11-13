@@ -35,7 +35,7 @@ async fn run_async(
     context: u32,
     max_tokens: u32,
     prompt: Option<&str>,
-    force: bool,
+    _force: bool,
 ) -> anyhow::Result<()> {
     let resolved_path = hypura::server::registry::resolve_model_path(model_path)?;
     let path = resolved_path.as_path();

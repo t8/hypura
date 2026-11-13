@@ -29,6 +29,16 @@ pub fn compute_placement_with_context(
     hardware: &HardwareProfile,
     context_length: u32,
 ) -> anyhow::Result<PlacementPlan> {
+    compute_placement_with_context_and_kv_quant(model, hardware, context_length, None)
+}
+
+/// Compute placement with a specific context length and optional KV cache quantization override.
+pub fn compute_placement_with_context_and_kv_quant(
+    model: &GgufFile,
+    hardware: &HardwareProfile,
+    context_length: u32,
+    kv_quant_override: Option<KvQuantization>,
+) -> anyhow::Result<PlacementPlan> {
     let metadata = ModelMetadata::from_gguf(model)?;
     let context_length = if context_length > 0 {
         context_length.min(metadata.context_length.max(2048))
@@ -40,15 +50,19 @@ pub fn compute_placement_with_context(
     // Score and sort tensors
     let scored = score_tensors(&model.tensors, &metadata);
 
+    let is_split = model.is_split();
+
     // Try streaming modes: sparse MoE mmap, expert-streaming, then dense FFN-streaming
-    let (tier_assignments, inference_mode) =
+    let (mut tier_assignments, inference_mode) =
         if let Some(assignments) = try_sparse_moe_mmap(&scored, &capacities, &metadata) {
             tracing::info!("Sparse MoE mmap: active working set fits in RAM, using OS page cache");
             (assignments, InferenceMode::SparseMoeMmap)
-        } else if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
+        } else if !is_split && try_expert_streaming_assign(&scored, &capacities, &metadata).is_some() {
+            let es = try_expert_streaming_assign(&scored, &capacities, &metadata).unwrap();
             tracing::info!("Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe");
             (es, InferenceMode::ExpertStreaming)
-        } else if let Some(ds) = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata) {
+        } else if !is_split && try_dense_ffn_streaming_assign(&scored, &capacities, &metadata).is_some() {
+            let ds = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata).unwrap();
             tracing::info!("Dense FFN-streaming placement: attention+norms on GPU, FFN on NVMe");
             (ds, InferenceMode::DenseFfnStreaming)
         } else {
@@ -73,12 +87,35 @@ pub fn compute_placement_with_context(
             (assignments, mode)
         };
 
+    if is_split {
+        // Multi-shard split models cannot use single-file NVMe streaming buffer.
+        // Remap any NVMe tier assignments to RAM so llama.cpp natively mmaps all shards.
+        let nvme_remap_count = tier_assignments.values().filter(|t| **t == StorageTier::Nvme).count();
+        if nvme_remap_count > 0 {
+            tracing::info!(
+                "Split model detected: remapping {} NVMe tensors to RAM tier for native multi-shard mmap",
+                nvme_remap_count
+            );
+            for tier in tier_assignments.values_mut() {
+                if *tier == StorageTier::Nvme {
+                    *tier = StorageTier::Ram;
+                }
+            }
+        }
+    }
+
     // Build prefetch schedule
     let prefetch_schedule =
         build_prefetch_schedule(&tier_assignments, &model.tensors, &metadata, hardware);
 
     // KV cache plan
-    let kv_cache_plan = compute_kv_cache_plan(&metadata, context_length, &tier_assignments, &capacities);
+    let kv_cache_plan = compute_kv_cache_plan(
+        &metadata,
+        context_length,
+        &tier_assignments,
+        &capacities,
+        kv_quant_override,
+    );
 
     // Quick tok/s estimate for the plan
     let estimated_tok_per_sec = quick_estimate(
@@ -141,20 +178,36 @@ fn compute_tier_capacities(
     // Reserve space for KV cache and GPU runtime (compute buffers, Metal overhead).
     // On unified memory (Apple Silicon), total RAM is shared between GPU and CPU,
     // but Metal imposes a hard process limit (recommendedMaxWorkingSetSize, e.g. ~17.8 GB on 24 GB Mac).
-    let kv_headroom = estimate_kv_bytes(metadata, context_length);
-    let metal_safe_limit = gpu_max.min(usable);
-
+    let raw_kv = estimate_kv_bytes(metadata, context_length);
+    // For large contexts (>= 32k or > 4GB raw KV), we auto-quantize to Q4_0 (0.28x) or Q8_0 (0.53x)
+    let kv_scale = if context_length >= 32768 || raw_kv > (4u64 << 30) {
+        0.28 // Q4_0
+    } else if context_length >= 16384 || raw_kv > (500 * (1 << 20)) {
+        0.53 // Q8_0
+    } else {
+        1.0 // F16
+    };
     let arch_lower = metadata.architecture.to_lowercase();
-    let is_ssm_hybrid = arch_lower.contains("gemma")
+    let is_linear_attn_hybrid = arch_lower.contains("qwen35")
+        || arch_lower.contains("qwen3next")
+        || arch_lower.contains("nemotron_h")
+        || arch_lower.contains("falcon-h1")
+        || arch_lower.contains("granitehybrid")
+        || arch_lower.contains("plamo2")
         || arch_lower.contains("delta")
         || arch_lower.contains("mamba")
         || arch_lower.contains("rwkv")
         || arch_lower.contains("jamba");
 
-    let gpu_overhead = if is_ssm_hybrid {
-        5800 * 1024 * 1024
-    } else if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
-        4800 * 1024 * 1024
+    let kv_headroom = if is_linear_attn_hybrid {
+        ((raw_kv as f64 * kv_scale * 0.28) as u64) + 160 * 1024 * 1024
+    } else {
+        (raw_kv as f64 * kv_scale) as u64
+    };
+    let metal_safe_limit = gpu_max.min(usable);
+
+    let gpu_overhead = if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
+        3600 * 1024 * 1024
     } else {
         GPU_RUNTIME_OVERHEAD
     };
@@ -229,6 +282,7 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
             let bonus = match role {
                 TensorRole::Norm => 10.0,
                 TensorRole::Embedding | TensorRole::OutputHead => 5.0,
+                TensorRole::NgramEmbedding => 0.0001, // Sparse point lookup: always kept in RAM/NVMe
                 _ => 1.0,
             };
 
@@ -312,7 +366,7 @@ fn try_expert_streaming_assign(
 
     let non_expert_bytes: u64 = tensors
         .iter()
-        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts))
+        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts | TensorRole::NgramEmbedding))
         .map(|t| t.size_bytes)
         .sum();
     let expert_bytes: u64 = tensors
@@ -349,10 +403,10 @@ fn try_expert_streaming_assign(
     let mut assignments = HashMap::new();
     let mut gpu_remaining = caps.gpu_bytes;
 
-    // Assign non-expert tensors to GPU/RAM by score
+    // Assign non-expert tensors to GPU/RAM by score (excluding sparse N-gram embeddings)
     let mut non_experts: Vec<&ScoredTensor> = tensors
         .iter()
-        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts))
+        .filter(|t| !matches!(t.role, TensorRole::MoeFusedExperts | TensorRole::NgramEmbedding))
         .collect();
     non_experts.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
@@ -363,6 +417,14 @@ fn try_expert_streaming_assign(
         } else {
             assignments.insert(t.name.clone(), StorageTier::Ram);
         }
+    }
+
+    // Sparse N-gram embedding tables (e.g. Qwen 3.8 Flash Next 51B table) stay in RAM/NVMe
+    for t in tensors
+        .iter()
+        .filter(|t| matches!(t.role, TensorRole::NgramEmbedding))
+    {
+        assignments.insert(t.name.clone(), StorageTier::Ram);
     }
 
     // All expert tensors to NVMe
@@ -402,7 +464,7 @@ fn try_dense_ffn_streaming_assign(
 
     let non_ffn_bytes: u64 = tensors
         .iter()
-        .filter(|t| !is_ffn(&t.role))
+        .filter(|t| !is_ffn(&t.role) && !matches!(t.role, TensorRole::NgramEmbedding))
         .map(|t| t.size_bytes)
         .sum();
     let ffn_bytes: u64 = tensors.iter().filter(|t| is_ffn(&t.role)).map(|t| t.size_bytes).sum();
@@ -437,7 +499,10 @@ fn try_dense_ffn_streaming_assign(
     let mut assignments = HashMap::new();
     let mut gpu_remaining = caps.gpu_bytes;
 
-    let mut non_ffn: Vec<&ScoredTensor> = tensors.iter().filter(|t| !is_ffn(&t.role)).collect();
+    let mut non_ffn: Vec<&ScoredTensor> = tensors
+        .iter()
+        .filter(|t| !is_ffn(&t.role) && !matches!(t.role, TensorRole::NgramEmbedding))
+        .collect();
     non_ffn.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
     for t in non_ffn {
@@ -447,6 +512,10 @@ fn try_dense_ffn_streaming_assign(
         } else {
             assignments.insert(t.name.clone(), StorageTier::Ram);
         }
+    }
+
+    for t in tensors.iter().filter(|t| matches!(t.role, TensorRole::NgramEmbedding)) {
+        assignments.insert(t.name.clone(), StorageTier::Ram);
     }
 
     for t in tensors.iter().filter(|t| is_ffn(&t.role)) {
@@ -493,7 +562,15 @@ fn greedy_assign(
     let mut unified_remaining = caps.unified_limit;
 
     for t in &non_layer_tensors {
-        if t.size_bytes <= gpu_remaining && t.size_bytes <= unified_remaining {
+        if matches!(t.role, TensorRole::NgramEmbedding) {
+            // N-gram embeddings are sparse lookup tables; keep them out of GPU VRAM
+            if t.size_bytes <= unified_remaining {
+                unified_remaining -= t.size_bytes;
+                assignments.insert(t.name.clone(), StorageTier::Ram);
+            } else {
+                assignments.insert(t.name.clone(), StorageTier::Nvme);
+            }
+        } else if t.size_bytes <= gpu_remaining && t.size_bytes <= unified_remaining {
             gpu_remaining -= t.size_bytes;
             unified_remaining -= t.size_bytes;
             assignments.insert(t.name.clone(), StorageTier::Gpu);
@@ -800,6 +877,7 @@ fn compute_kv_cache_plan(
     context_length: u32,
     _assignments: &HashMap<String, StorageTier>,
     caps: &TierCapacities,
+    kv_quant_override: Option<KvQuantization>,
 ) -> KvCachePlan {
     let kv_per_token_fp16 = estimate_kv_bytes(metadata, 1);
     if kv_per_token_fp16 == 0 {
@@ -816,29 +894,40 @@ fn compute_kv_cache_plan(
 
     let total_fp16_kv = kv_per_token_fp16 * context_length as u64;
 
-    // Auto-select KV quantization when GPU headroom is tight:
-    // If FP16 KV exceeds 500 MB or GPU headroom is < 3 GB, use Q8_0
-    let kv_quantization = if total_fp16_kv > (1u64 << 30) || caps.gpu_bytes < total_fp16_kv + (2 * (1 << 30)) {
-        Some(KvQuantization::Q8_0)
-    } else if total_fp16_kv > (500 * (1 << 20)) {
-        Some(KvQuantization::Q8_0)
-    } else {
-        None
-    };
+    // Use explicit override if provided; otherwise auto-select based on context and headroom
+    let kv_quantization = kv_quant_override.or_else(|| {
+        if context_length >= 32768
+            || total_fp16_kv > (4u64 << 30)
+            || (caps.gpu_bytes < total_fp16_kv / 2 && context_length >= 16384)
+        {
+            Some(KvQuantization::Q4_0)
+        } else if context_length >= 16384
+            || total_fp16_kv > (500 * (1 << 20))
+            || caps.gpu_bytes < total_fp16_kv + (2 * (1 << 30))
+        {
+            Some(KvQuantization::Q8_0)
+        } else {
+            None
+        }
+    });
 
-    let kv_per_token = if kv_quantization.is_some() {
-        kv_per_token_fp16 / 2
-    } else {
-        kv_per_token_fp16
+    let kv_per_token = match kv_quantization {
+        Some(KvQuantization::Q4_0) => ((kv_per_token_fp16 as f64) * 0.28).ceil() as u64,
+        Some(KvQuantization::Q8_0) => ((kv_per_token_fp16 as f64) * 0.53).ceil() as u64,
+        _ => kv_per_token_fp16,
     };
 
     // 20% of GPU budget for hot KV cache
     let gpu_kv_budget = caps.gpu_bytes / 5;
-    let hot_tokens = (gpu_kv_budget / kv_per_token).min(context_length as u64) as u32;
+    let hot_tokens = (gpu_kv_budget / kv_per_token.max(1)).min(context_length as u64) as u32;
     let warm_tokens = context_length.saturating_sub(hot_tokens);
 
-    // Q8 warm cache uses ~half the bytes of FP16
-    let kv_per_token_q8 = kv_per_token_fp16 / 2;
+    // Warm cache uses Q4_0 if hot is Q4_0, otherwise Q8_0
+    let kv_per_token_warm = if matches!(kv_quantization, Some(KvQuantization::Q4_0)) {
+        kv_per_token
+    } else {
+        ((kv_per_token_fp16 as f64) * 0.53).ceil() as u64
+    };
 
     KvCachePlan {
         hot_window_tokens: hot_tokens,
@@ -846,7 +935,7 @@ fn compute_kv_cache_plan(
         hot_tier: StorageTier::Gpu,
         warm_tier: StorageTier::Ram,
         hot_bytes: hot_tokens as u64 * kv_per_token,
-        warm_bytes: warm_tokens as u64 * kv_per_token_q8,
+        warm_bytes: warm_tokens as u64 * kv_per_token_warm,
         kv_quantization,
     }
 }
@@ -977,6 +1066,7 @@ mod tests {
     use super::*;
     use crate::model::gguf::{GgmlType, TensorInfo};
 
+    #[allow(dead_code)]
     fn make_tensors(count: usize, size: u64) -> Vec<TensorInfo> {
         (0..count)
             .map(|i| TensorInfo {
@@ -1178,4 +1268,101 @@ mod tests {
         // Norm should have higher score (small + 10x bonus)
         assert!(scored[1].score > scored[0].score);
     }
+
+    #[test]
+    fn test_kv_quantization_selection() {
+        let meta = make_metadata(32);
+        let caps = TierCapacities {
+            gpu_bytes: 8 * (1 << 30),
+            ram_bytes: 16 * (1 << 30),
+            unified_limit: 20 * (1 << 30),
+            nvme_peak_bw: 5_000_000_000,
+        };
+        let assignments = HashMap::new();
+
+        // 8k context should stay Q8_0 or F16
+        let plan_8k = compute_kv_cache_plan(&meta, 8192, &assignments, &caps, None);
+        assert_ne!(plan_8k.kv_quantization, Some(KvQuantization::Q4_0));
+
+        // 64k massive context should select Q4_0
+        let plan_64k = compute_kv_cache_plan(&meta, 65536, &assignments, &caps, None);
+        assert_eq!(plan_64k.kv_quantization, Some(KvQuantization::Q4_0));
+        assert!(plan_64k.hot_window_tokens > 0);
+
+        // Explicit override: 2k context with forced Q4_0
+        let plan_override = compute_kv_cache_plan(&meta, 2048, &assignments, &caps, Some(KvQuantization::Q4_0));
+        assert_eq!(plan_override.kv_quantization, Some(KvQuantization::Q4_0));
+    }
+
+    #[test]
+    fn test_ngram_embedding_placement() {
+        let meta = make_metadata(32);
+        let caps = TierCapacities {
+            gpu_bytes: 8 * (1 << 30),
+            ram_bytes: 16 * (1 << 30),
+            unified_limit: 20 * (1 << 30),
+            nvme_peak_bw: 5_000_000_000,
+        };
+        let hw = HardwareProfile {
+            timestamp: chrono::Utc::now(),
+            system: crate::profiler::types::SystemInfo {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                machine_model: "Mac16,7".into(),
+                total_cores: 14,
+            },
+            memory: crate::profiler::types::MemoryProfile {
+                total_bytes: 24 * (1 << 30),
+                available_bytes: 18 * (1 << 30),
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                is_unified: true,
+            },
+            gpu: Some(crate::profiler::types::GpuProfile {
+                name: "Apple M4 Pro".into(),
+                vram_bytes: 19069 * 1024 * 1024,
+                bandwidth_bytes_per_sec: 273_000_000_000,
+                fp16_tflops: 20.0,
+                backend: crate::profiler::types::GpuBackend::Metal,
+            }),
+            storage: vec![],
+            cpu: crate::profiler::types::CpuProfile {
+                model_name: "Apple M4 Pro".into(),
+                cores_performance: 10,
+                cores_efficiency: 4,
+                has_amx: true,
+                has_neon: true,
+                has_avx512: false,
+                has_avx2: false,
+                int8_gflops: 1000.0,
+            },
+        };
+
+        let tensors = vec![
+            TensorInfo {
+                name: "model.ngram_embeddings.weight".into(),
+                dimensions: vec![5120, 248320],
+                dtype: GgmlType::Q4K,
+                offset: 0,
+                size_bytes: 10 * (1 << 30), // 10 GB N-gram table
+                layer_index: None,
+            },
+            TensorInfo {
+                name: "token_embd.weight".into(),
+                dimensions: vec![5120, 248320],
+                dtype: GgmlType::Q4K,
+                offset: 10 * (1 << 30),
+                size_bytes: 2 * (1 << 30),
+                layer_index: None,
+            },
+        ];
+
+        let scored = score_tensors(&tensors, &meta);
+        assert_eq!(scored[0].role, TensorRole::NgramEmbedding);
+        assert!(scored[0].score < scored[1].score);
+
+        let assignments = greedy_assign(&scored, &caps, &hw, &meta);
+        // N-gram embeddings must be scheduled to RAM, not GPU VRAM!
+        assert_eq!(assignments.get("model.ngram_embeddings.weight"), Some(&StorageTier::Ram));
+    }
 }
+

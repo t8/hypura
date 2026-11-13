@@ -9,13 +9,15 @@ fn main() {
     );
 
     // Build llama.cpp via cmake
-    let dst = cmake::Config::new(&llama_dir)
+    let mut cmake_cfg = cmake::Config::new(&llama_dir);
+    cmake_cfg
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_COMMON", "OFF")
+        .define("LLAMA_BUILD_APP", "OFF")
         .define("LLAMA_OPENSSL", "OFF")
         .define("GGML_METAL", "ON")
         .define("GGML_METAL_EMBED_LIBRARY", "ON")
@@ -23,8 +25,16 @@ fn main() {
         .define("GGML_NATIVE", "OFF")
         .define("GGML_BLAS", "OFF")
         .define("GGML_OPENMP", "OFF")
-        .define("GGML_CPU_REPACK", "OFF")
-        .build();
+        .define("GGML_CPU_REPACK", "OFF");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Enable hardware ARMv8.6 NEON dotprod (`vdotq_s32`), fp16 vector arithmetic,
+        // and int8 matrix multiply (`vmmlaq_s32`) for quantized CPU layers without enabling SME.
+        cmake_cfg.define("GGML_CPU_ARM_ARCH", "armv8.6-a+dotprod+fp16+i8mm");
+    }
+
+    let dst = cmake_cfg.build();
 
     let lib_dir = dst.join("lib");
 

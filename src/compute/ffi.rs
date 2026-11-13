@@ -78,7 +78,11 @@ impl LlamaModel {
 
         let mut params = unsafe { hypura_sys::llama_model_default_params() };
         params.n_gpu_layers = n_gpu_layers;
-        params.use_mmap = use_mmap;
+        params.load_mode = if use_mmap {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP
+        } else {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_NONE
+        };
 
         let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
         anyhow::ensure!(!ptr.is_null(), "Failed to load model from {}", path.display());
@@ -104,7 +108,11 @@ impl LlamaModel {
 
         let mut params = unsafe { hypura_sys::llama_model_default_params() };
         params.n_gpu_layers = n_gpu_layers;
-        params.use_mmap = use_mmap;
+        params.load_mode = if use_mmap {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP
+        } else {
+            hypura_sys::llama_load_mode_LLAMA_LOAD_MODE_NONE
+        };
         params.tensor_buft_overrides = overrides;
 
         let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
@@ -122,6 +130,11 @@ impl LlamaModel {
 
     pub fn n_layers(&self) -> i32 {
         unsafe { hypura_sys::llama_model_n_layer(self.ptr) }
+    }
+
+    /// Sliding-window attention size (`0` if the model does not use SWA).
+    pub fn n_swa(&self) -> i32 {
+        unsafe { hypura_sys::llama_model_n_swa(self.ptr) }
     }
 
     /// Get the model's embedded chat template, if any.
@@ -222,6 +235,79 @@ impl LlamaModel {
         }
         String::from_utf8_lossy(&buf).to_string()
     }
+
+    /// Apply a chat template to a series of `(role, content)` message tuples using llama.cpp's
+    /// built-in template engine.
+    ///
+    /// If `custom_template` is `None`, uses the model's embedded template.
+    /// `add_assistant_prompt` controls whether to append the assistant turn header (e.g. `<|im_start|>assistant\n`).
+    pub fn apply_chat_template(
+        &self,
+        custom_template: Option<&str>,
+        messages: &[(&str, &str)],
+        add_assistant_prompt: bool,
+    ) -> Option<String> {
+        let custom_c = custom_template.and_then(|t| std::ffi::CString::new(t).ok());
+        let tmpl_ptr = if let Some(ref c) = custom_c {
+            c.as_ptr()
+        } else {
+            unsafe { hypura_sys::llama_model_chat_template(self.ptr, std::ptr::null()) }
+        };
+
+        if tmpl_ptr.is_null() {
+            return None;
+        }
+
+        let mut role_cstrings = Vec::with_capacity(messages.len());
+        let mut content_cstrings = Vec::with_capacity(messages.len());
+        let mut chat_msgs = Vec::with_capacity(messages.len());
+
+        for (role, content) in messages {
+            let r = std::ffi::CString::new(*role).ok()?;
+            let c = std::ffi::CString::new(*content).ok()?;
+            chat_msgs.push(hypura_sys::llama_chat_message {
+                role: r.as_ptr(),
+                content: c.as_ptr(),
+            });
+            role_cstrings.push(r);
+            content_cstrings.push(c);
+        }
+
+        // Measure formatted buffer size
+        let needed_size = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl_ptr,
+                chat_msgs.as_ptr(),
+                chat_msgs.len(),
+                add_assistant_prompt,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if needed_size < 0 {
+            return None;
+        }
+
+        let mut buf = vec![0u8; (needed_size as usize) + 1];
+        let res = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl_ptr,
+                chat_msgs.as_ptr(),
+                chat_msgs.len(),
+                add_assistant_prompt,
+                buf.as_mut_ptr() as *mut i8,
+                buf.len() as i32,
+            )
+        };
+
+        if res < 0 {
+            return None;
+        }
+
+        buf.truncate(res as usize);
+        String::from_utf8(buf).ok()
+    }
 }
 
 impl Drop for LlamaModel {
@@ -240,7 +326,7 @@ pub struct LlamaContext {
 impl LlamaContext {
     /// Create a new inference context from a loaded model.
     pub fn new(model: &LlamaModel, n_ctx: u32, n_batch: u32, n_threads: i32) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, None, std::ptr::null_mut(), None)
+        Self::new_inner(model, n_ctx, n_batch, n_batch, n_threads, None, std::ptr::null_mut(), None, true)
     }
 
     /// Create a context with a cb_eval callback for layer tracking.
@@ -253,7 +339,7 @@ impl LlamaContext {
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, None)
+        Self::new_inner(model, n_ctx, n_batch, n_batch, n_threads, cb_eval, callback_data, None, false)
     }
 
     /// Create a context with callback and KV cache quantization.
@@ -266,27 +352,70 @@ impl LlamaContext {
         callback_data: *mut std::ffi::c_void,
         kv_quant: Option<crate::scheduler::types::KvQuantization>,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, kv_quant)
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_batch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            kv_quant,
+            cb_eval.is_none(),
+        )
     }
 
-    fn new_inner(
+    /// Create a context with explicit `n_ubatch` and `op_offload` control.
+    /// Disabling `op_offload` and capping `n_ubatch` on partially GPU-offloaded models
+    /// avoids hundreds of CPU<->Metal graph splits and prevents staging CPU weights into
+    /// Metal command buffers under tight unified memory pressure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
         model: &LlamaModel,
         n_ctx: u32,
         n_batch: u32,
+        n_ubatch: u32,
         n_threads: i32,
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
         kv_quant: Option<crate::scheduler::types::KvQuantization>,
+        op_offload: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_ubatch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            kv_quant,
+            op_offload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_ubatch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+        kv_quant: Option<crate::scheduler::types::KvQuantization>,
+        op_offload: bool,
     ) -> anyhow::Result<Self> {
         use crate::scheduler::types::KvQuantization;
 
         let mut params = unsafe { hypura_sys::llama_context_default_params() };
         params.n_ctx = n_ctx;
         params.n_batch = n_batch;
-        params.n_ubatch = n_batch;
+        params.n_ubatch = n_ubatch.min(n_batch).max(1);
         params.n_threads = n_threads;
         params.n_threads_batch = n_threads;
         params.offload_kqv = true;
+        params.op_offload = op_offload;
 
         if let Some(kv) = kv_quant {
             let ggml_type = match kv {
@@ -335,8 +464,128 @@ impl LlamaContext {
         }
     }
 
+    /// Save context/KV state to a disk file.
+    pub fn save_state_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid unicode path"))?;
+        let c_path = std::ffi::CString::new(path_str)?;
+
+        let ok = unsafe { hypura_sys::llama_state_save_file(self.ptr, c_path.as_ptr(), std::ptr::null(), 0) };
+        if !ok {
+            anyhow::bail!("Failed to save llama context state to {}", path.display());
+        }
+        tracing::info!("Saved KV cache state to {}", path.display());
+        Ok(())
+    }
+
+    /// Load context/KV state from a disk file.
+    pub fn load_state_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        if !path.exists() {
+            anyhow::bail!("State file {} does not exist", path.display());
+        }
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid unicode path"))?;
+        let c_path = std::ffi::CString::new(path_str)?;
+
+        let ok = unsafe { hypura_sys::llama_state_load_file(self.ptr, c_path.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
+        if !ok {
+            anyhow::bail!("Failed to load llama context state from {}", path.display());
+        }
+        tracing::info!("Loaded KV cache state from {}", path.display());
+        Ok(())
+    }
+
+    /// Returns the total serialized size (in bytes) of this context's state.
+    pub fn state_size(&self) -> usize {
+        unsafe { hypura_sys::llama_state_get_size(self.ptr) }
+    }
+
+    /// Serializes the entire context state (KV cache and recurrent hidden states)
+    /// into an in-memory buffer.
+    pub fn save_state_to_memory(&self) -> anyhow::Result<Vec<u8>> {
+        let size = self.state_size();
+        if size == 0 {
+            anyhow::bail!("Failed to determine context state size");
+        }
+        let mut buf = vec![0u8; size];
+        let copied = unsafe {
+            hypura_sys::llama_state_get_data(self.ptr, buf.as_mut_ptr(), size)
+        };
+        if copied == 0 {
+            anyhow::bail!("Failed to copy context state to memory buffer");
+        }
+        buf.truncate(copied);
+        Ok(buf)
+    }
+
+    /// Deserializes and restores context state (KV cache and recurrent hidden states)
+    /// from an in-memory buffer.
+    pub fn load_state_from_memory(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        let read = unsafe {
+            hypura_sys::llama_state_set_data(self.ptr, data.as_ptr(), data.len())
+        };
+        if read == 0 {
+            anyhow::bail!("Failed to restore context state from memory buffer");
+        }
+        Ok(())
+    }
+
     pub fn as_ptr(&self) -> *mut hypura_sys::llama_context {
         self.ptr
+    }
+
+    /// Clear all KV / recurrent sequence metadata and buffers so decoding starts fresh from position 0.
+    pub fn clear_memory(&mut self) {
+        let mem = unsafe { hypura_sys::llama_get_memory(self.ptr) };
+        if !mem.is_null() {
+            unsafe { hypura_sys::llama_memory_clear(mem, true) };
+        }
+    }
+
+    /// Trim sequence 0 KV memory to retain `[0, keep_len)` and remove `[keep_len, inf)`.
+    ///
+    /// Returns `keep_len` if the prefix remains valid (including SWA window & recurrent state
+    /// checks), or `0` after clearing memory if partial sequence removal is unsupported or
+    /// would invalidate the sliding-window cache.
+    pub fn trim_kv_to_prefix(&mut self, keep_len: usize, n_swa: i32) -> usize {
+        if keep_len == 0 {
+            self.clear_memory();
+            return 0;
+        }
+
+        let mem = unsafe { hypura_sys::llama_get_memory(self.ptr) };
+        if mem.is_null() {
+            return 0;
+        }
+
+        let pos_max = unsafe { hypura_sys::llama_memory_seq_pos_max(mem, 0) };
+        let target_pos_max = (keep_len as i32) - 1;
+
+        if pos_max < target_pos_max {
+            self.clear_memory();
+            return 0;
+        }
+
+        if pos_max > target_pos_max {
+            let ok = unsafe { hypura_sys::llama_memory_seq_rm(mem, 0, keep_len as i32, -1) };
+            if !ok {
+                self.clear_memory();
+                return 0;
+            }
+        }
+
+        let new_min = unsafe { hypura_sys::llama_memory_seq_pos_min(mem, 0) };
+        let new_max = unsafe { hypura_sys::llama_memory_seq_pos_max(mem, 0) };
+        let swa_valid = n_swa <= 0 || new_min == 0 || new_min <= (keep_len as i32 - n_swa);
+
+        if new_min < 0 || new_max != target_pos_max || !swa_valid {
+            self.clear_memory();
+            return 0;
+        }
+
+        keep_len
     }
 }
 
@@ -364,6 +613,7 @@ impl LlamaSampler {
                 hypura_sys::llama_sampler_chain_add(
                     ptr,
                     hypura_sys::llama_sampler_init_penalties(
+                        320_000,
                         params.repeat_last_n,
                         params.repeat_penalty,
                         0.0,
@@ -427,5 +677,45 @@ mod tests {
         assert!(p.temperature > 0.0);
         assert!(p.top_k > 0);
         assert!(p.max_tokens > 0);
+    }
+
+    #[test]
+    fn test_llama_chat_apply_template() {
+        let _backend = LlamaBackend::init();
+        let tmpl = std::ffi::CString::new("chatml").unwrap();
+        let r1 = std::ffi::CString::new("user").unwrap();
+        let c1 = std::ffi::CString::new("hello world").unwrap();
+        let msgs = [hypura_sys::llama_chat_message {
+            role: r1.as_ptr(),
+            content: c1.as_ptr(),
+        }];
+
+        let len = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                msgs.as_ptr(),
+                msgs.len(),
+                true,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(len > 0);
+        let mut buf = vec![0u8; (len + 1) as usize];
+        let res = unsafe {
+            hypura_sys::llama_chat_apply_template(
+                tmpl.as_ptr(),
+                msgs.as_ptr(),
+                msgs.len(),
+                true,
+                buf.as_mut_ptr() as *mut i8,
+                buf.len() as i32,
+            )
+        };
+        assert_eq!(res, len);
+        buf.truncate(res as usize);
+        let formatted = String::from_utf8(buf).unwrap();
+        assert!(formatted.contains("<|im_start|>user\nhello world<|im_end|>"));
+        assert!(formatted.contains("<|im_start|>assistant\n"));
     }
 }

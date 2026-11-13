@@ -24,6 +24,10 @@
 benchmarks/results/*
 !benchmarks/results/.gitkeep
 
+# Build outputs
+/dist/
+mac-app/Hypura
+
 # Temporary / Scratch
 nohup.out
 .tests/

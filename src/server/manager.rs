@@ -7,7 +7,6 @@ use crate::compute::inference::{
 };
 use crate::model::gguf::GgufFile;
 use crate::profiler;
-use crate::scheduler::placement::compute_placement_with_context;
 use crate::server::ollama_types::GgufInfo;
 use crate::server::registry::{ModelRegistry, RegisteredModel};
 
@@ -25,6 +24,7 @@ pub struct ModelManager {
     pub registry: ModelRegistry,
     pub active_model: Option<ActiveModel>,
     pub default_context: u32,
+    pub default_kv_quant: Option<crate::scheduler::types::KvQuantization>,
 }
 
 impl ModelManager {
@@ -32,15 +32,17 @@ impl ModelManager {
         registry: ModelRegistry,
         default_context: u32,
         initial_model_path: Option<&str>,
+        default_kv_quant: Option<crate::scheduler::types::KvQuantization>,
     ) -> anyhow::Result<Self> {
         let mut manager = Self {
             registry,
             active_model: None,
             default_context,
+            default_kv_quant,
         };
 
-        if let Some(path_str) = initial_model_path {
-            manager.load_model_by_path(Path::new(path_str), default_context)?;
+        if let Some(initial_name_or_path) = initial_model_path {
+            manager.get_or_load(initial_name_or_path, Some(default_context))?;
         }
 
         Ok(manager)
@@ -56,10 +58,12 @@ impl ModelManager {
     ) -> anyhow::Result<(Arc<std::sync::Mutex<LoadedModel>>, String, GgufInfo)> {
         // 1. Check if an active model matches requested_name
         let active_match = self.active_model.as_ref().map(|active| {
-            active.name.eq_ignore_ascii_case(requested_name)
+            let a_lower = active.name.to_lowercase();
+            let r_lower = requested_name.to_lowercase();
+            a_lower == r_lower
                 || requested_name.is_empty()
-                || active.name.starts_with(requested_name)
-                || requested_name.starts_with(&active.name)
+                || a_lower.starts_with(&r_lower)
+                || r_lower.starts_with(&a_lower)
                 || active.path == std::path::Path::new(requested_name)
         }).unwrap_or(false);
 
@@ -163,7 +167,12 @@ impl ModelManager {
             }
         };
 
-        let plan = compute_placement_with_context(&gguf, &hardware, context_size)?;
+        let plan = crate::scheduler::placement::compute_placement_with_context_and_kv_quant(
+            &gguf,
+            &hardware,
+            context_size,
+            self.default_kv_quant,
+        )?;
         let gpu_budget = compute_gpu_budget(&hardware, &model_entry.metadata, context_size);
         let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
 
@@ -196,6 +205,7 @@ impl ModelManager {
     }
 
     /// Load a model directly by file path
+    #[allow(dead_code)]
     fn load_model_by_path(
         &mut self,
         path: &Path,
@@ -218,5 +228,51 @@ impl ModelManager {
         };
 
         self.load_model_entry(&entry, context_size)
+    }
+
+    /// Check if the active model has been idle for longer than `idle_timeout` and unload it if so.
+    /// Returns true if a model was unloaded.
+    pub fn maybe_unload_idle(&mut self, idle_timeout: std::time::Duration) -> bool {
+        if let Some(ref mut active) = self.active_model {
+            // Ensure we never unload a model while a request is in flight:
+            // 1. Arc::strong_count(&active.loaded) > 1 means an active route handler currently holds a reference.
+            // 2. active.loaded.try_lock().is_err() means a thread is actively executing inference inside the lock.
+            let is_busy = Arc::strong_count(&active.loaded) > 1 || active.loaded.try_lock().is_err();
+            if is_busy {
+                active.last_used = Instant::now();
+                return false;
+            }
+
+            if active.last_used.elapsed() >= idle_timeout {
+                tracing::info!(
+                    "Active model '{}' has been idle for {:.1}s (timeout: {:.1}s); unloading to reclaim unified memory",
+                    active.name,
+                    active.last_used.elapsed().as_secs_f64(),
+                    idle_timeout.as_secs_f64()
+                );
+                self.active_model = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_maybe_unload_idle_timeout() {
+        let registry = ModelRegistry::new(None, None);
+        let mut manager = ModelManager {
+            registry,
+            active_model: None,
+            default_context: 2048,
+            default_kv_quant: None,
+        };
+
+        // No model loaded -> returns false
+        assert!(!manager.maybe_unload_idle(std::time::Duration::from_secs(60)));
     }
 }

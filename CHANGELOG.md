@@ -4,6 +4,145 @@ All notable changes to the **Hypura** project are documented in this file.
 
 ---
 
+## [0.2.7] - 2026-11-12
+
+### 🐛 Multi-Shard GGUF & Sparse MoE Reasoning Fixes
+
+#### 1. Multi-Shard Split GGUF Native Mmap Support (`src/model/gguf.rs`, `src/scheduler/placement.rs`, `src/compute/inference.rs`)
+* Added `GgufFile::is_split()` detecting multi-file GGUF partitions (`split.count > 1`, `split.no`, or `*-00001-of-00004.gguf`).
+* Fixed GGUF header parsing for 16-bit metadata fields (`Uint16` / `Int16` in `as_u32()`).
+* Bypassed single-file streaming controllers (`try_expert_streaming_assign`, `try_dense_ffn_streaming_assign`) for split models, automatically remapping `StorageTier::Nvme` to `StorageTier::Ram` so `llama.cpp` natively memory-maps all split shards.
+* Prevented `Hypura_NVMe` custom buffer type from performing single-descriptor `pread` on multi-shard files, which previously caused uninitialized all-zero weights and incoherent token soup across MoE layers.
+* Updated `select_partial_offload_strategy_with_plan` to enforce `PartialOffloadStrategy::StandardMmap` for split models, eliminating 38+ GiB virtual memory allocation spikes caused by cross-shard intra-file offset differences.
+
+#### 2. Submodule Upgrade to `llama.cpp` b12086 (`vendor/llama.cpp`)
+* Upgraded `vendor/llama.cpp` submodule to official release `b12086` (`749db7f03`), preserving custom GLM-4 MLA support while adding official upstream support for `Q2_0` (type 42) and direct QSA attention selection (`build_qsa_sel`).
+* Resolves attention-mask matrix corruption during autoregressive decoding on hybrid SSM/MoE architectures (such as `Qwen 3.8 Flash Next` / `qwen3next`).
+
+#### 3. ModelManager Idle Reaper In-Flight Request Protection (`src/server/manager.rs`)
+* Updated `maybe_unload_idle` to verify active request locks and reference counts (`Arc::strong_count(&active.loaded) > 1 || active.loaded.try_lock().is_err()`).
+* Postpones the idle timeout timestamp (`active.last_used = Instant::now()`) while long prompt prefill or token generation requests are actively executing.
+* Fixed case-insensitive model name matching in `get_or_load` so requests can match active models regardless of capitalization.
+* Increased default `IDLE_TIMEOUT` in `start_qwen_flash.sh` to 1800s (30 minutes).
+
+#### 4. Model Library Management: Pull, Rm, and Runtime Directory Overrides (`src/model/pull.rs`, `src/cli/pull.rs`, `src/cli/rm.rs`, `src/server/routes.rs`)
+* **CLI `hypura pull <model>` & Ollama `POST /api/pull`**: Added model downloading with live resume (`curl -C - -L`), progress bar, speed reporting, and Ollama-compatible NDJSON streaming (`{"status": "downloading", "total": ..., "completed": ...}`).
+* **Model Alias Resolution**: Resolves top 2026/2025 coding & tool-calling models (`gemma-4:26b`, `gemma-4:31b`, `qwen3.8:27b`, `qwen2.5-coder:32b`, `mistral-small:24b`, `deepseek-coder-v2-lite`), arbitrary HuggingFace repos (`owner/repo:quant`), and direct GGUF URLs.
+* **CLI `hypura rm <model>` & Ollama `DELETE /api/delete`**: Safely removes model files (and all multi-shard parts) from the library, automatically unloads active instances if needed, and refreshes the model registry.
+* **Runtime Models Directory Overrides**: Default models library can be overridden at runtime via `--models-dir` CLI flag, `models_dir` JSON parameter in `/api/pull` & `/api/delete`, `HYPURA_MODELS_DIR` environment variable, or automatic fallback to `/Volumes/RealtekData/models`.
+
+#### 5. Native macOS Settings Window & Permission Protection (`mac-app/HypuraMenuApp.swift`, `src/server/registry.rs`)
+* **macOS Settings / Preferences Window**: Added AppKit preferences window to `Hypura.app` with folder browser (`NSOpenPanel`), port input, context size dropdown (`32k`, `16k`, `8k`, `4k`), idle timeout, KV quantization (`q8_0`, `q4_0`, `f16`), server start/stop/restart controls, and persistent storage via `UserDefaults`.
+* **TCC Permission Protection**: Prevented recursive scanning of `$HOME` when launched via Finder/LaunchServices, explicitly skipping macOS protected user folders (`Music`, `Pictures`, `Movies`, `Library`, etc.) to eliminate Apple Music/Media authorization dialogs.
+* **Automatic Ollama Storage Discovery**: Automatically detects and resolves `/Volumes/RealtekData/OllamaModels` and `~/.ollama/models` symlinks, discovering existing installed models out-of-the-box.
+
+---
+
+## [0.2.6] - 2026-11-08
+
+### 🐛 Bug Fixes & Agentic Coding Optimizations
+
+#### 1. Quantized KV Cache Scaling in Metal GPU Budget (`src/compute/inference.rs`, `src/scheduler/placement.rs`)
+* Fixed `compute_gpu_budget` subtracting unquantized FP16 KV memory at 16k–128k contexts instead of applying the auto-selected `Q4_0` ($0.28\times$ at $\ge 32\text{k}$ or $> 4\text{ GiB}$ raw KV) and `Q8_0` ($0.53\times$ at $\ge 16\text{k}$ or $> 500\text{ MiB}$ raw KV) multipliers.
+* Restores ~5–7.5 GiB of Metal GPU layer offload budget for 26B–30B models (e.g., Gemma 4 26B) on 24 GB / 32 GB Apple Silicon Macs at 32k+ default context.
+
+#### 2. Persistent Context & In-Memory Prompt Prefix KV Reuse (`src/compute/inference.rs`, `src/compute/ffi.rs`)
+* Added persistent `CachedSession` on `LoadedModel` to reuse `LlamaContext` and cached token prefixes across consecutive HTTP requests instead of rebuilding the context from token 0 on every turn.
+* Added `LlamaModel::n_swa`, `LlamaContext::clear_memory`, and `LlamaContext::trim_kv_to_prefix` with sliding-window attention (`n_swa`) and hybrid recurrent cache validation (`llama_memory_seq_rm` / `llama_memory_seq_pos_min`), cleanly falling back to full sequence reset when partial suffix removal is unsupported.
+* Dramatically accelerates multi-turn coding-agent workflows that resend 10k–25k system + tool-schema tokens on every request.
+
+#### 3. Streaming Keep-Alive Heartbeats & Proxy Anti-Buffering (`src/server/streaming.rs`, `src/server/routes.rs`)
+* Added 15-second SSE `: keep-alive` comments (`sse_openai_chat_stream`, `sse_openai_completion_stream`) and empty NDJSON delta heartbeats (`ndjson_chat_stream`, `ndjson_generate_stream`) throughout prompt prefill, `<|channel>thought` / `<think>` stripping, and buffered `tool_calls` generation.
+* Added `Cache-Control: no-cache`, `Connection: keep-alive`, and `X-Accel-Buffering: no` response headers across all streaming endpoints to prevent 120-second idle read timeouts over Tailscale Funnel, reverse proxies, and coding-agent HTTP clients.
+
+#### 4. Immediate Client Disconnect Cancellation (`src/server/streaming.rs`, `src/compute/inference.rs`, `src/server/routes.rs`)
+* Monitored `tx.closed()` inside all streaming tasks so dropped client connections immediately close the token channel even while thought or tool-call output is being buffered.
+* Added `token_tx.is_closed()` checks on acquiring the model mutex and before each 512-token `ctx.decode` prefill batch so cancelled requests abort within seconds and release `LoadedModel` for subsequent requests.
+
+#### 5. OpenAI `/v1/chat/completions` Tool-Call Wire Spec Compliance (`src/server/openai_types.rs`, `src/server/streaming.rs`, `src/server/routes.rs`)
+* Added required `"index"` field (`0, 1, ...`) to streamed `delta.tool_calls[]` items in `sse_openai_chat_stream` and separated the `delta.tool_calls` chunk (`finish_reason: null`) from the final `finish_reason: "tool_calls"` chunk so strict OpenAI SDKs and coding agents execute multi-turn tool loops reliably.
+* Fixed non-streaming `v1_chat_completions_handler` returning `finish_reason: "stop"` instead of `"tool_calls"` when `tool_calls` are present, set `message.content` to `null` on pure tool-call turns, added multi-part array `content` / string-or-array `stop` deserialization, and preserved `tool_call_id` → `tool_name` mapping across turns.
+* Replaced duplicated prefix buffering with unified `ChatStreamFilter` so `<think>`, `<|channel>thought`, `[THINK]`, ```` ```json ````, and mid-stream `<tool_call>` / `[TOOL_CALLS]` / `<TOOLCALL>` tags never leak into streamed `content` deltas.
+
+#### 6. Native Multi-Turn Tool Calling for Qwen 3.5/3.8, Gemma 4, Nemotron 30B & Mistral Small 3.x (`src/server/chat.rs`, `src/compute/inference.rs`)
+* **Qwen 3.5 / 3.8 & Qwen3-Coder**: Added native XML `<tool_call><function=...><parameter=...>...</parameter></function></tool_call>` prompt & multi-turn history formatting, grouped `<tool_response>` turns, and `<think>` prefill tracking.
+* **Gemma 4 (26B / 31B)**: Added native `<|turn>system\n<|think|>...<|tool>declaration:...<tool|><turn|>` declarations, open-turn `<|tool_response>response:...<tool_response|>` multi-turn grouping, and RFC-8259 JSON escaping for `<|"|>...<|"|>` string arguments containing quotes or code.
+* **NVIDIA Nemotron-3 30B & Nano v2**: Fixed `"nemo"` substring misrouting `"nemotron"` to Mistral `[INST]`; added dedicated ChatML XML `<function>` and `<TOOLCALL>[...]</TOOLCALL>` formatting and parsing.
+* **Mistral Small 3.1/3.2 (24B/26B) & Ministral 3**: Added `[SYSTEM_PROMPT]`, `[TOOL_CALLS]name[CALL_ID]id9[ARGS]{...}` (with 9-char alphanumeric call ID normalization), `[TOOL_RESULTS]id9[TOOL_CONTENT]...[/TOOL_RESULTS]`, and `[THINK]...[/THINK]` stripping/parsing.
+* **CoT-Safe Early Stop (`should_stop_early`)**: Prevented hypothetical `</function>` or `</tool_call>` mentions inside active `<think>`, `<|channel>thought`, or `[THINK]` reasoning blocks from prematurely terminating generation before the real tool call is emitted.
+
+#### 7. Metal Unified-Memory Residency & OOM Prevention on 27B–32B Partial GPU Offload (`src/compute/inference.rs`, `src/compute/ffi.rs`, `src/scheduler/placement.rs`)
+* **Prevented Whole-File `MTLResidencySet` Wiring (`select_partial_offload_strategy`)**: During partial GPU offload (e.g., 34/65 layers of Qwen 3.8 27B on a 24 GB Mac), `output_norm` / tied `token_embd` at offset `0` plus `blk.63` at the end of the GGUF previously caused `llama.cpp`'s `get_mapping_range` to wire the entire ~17.2 GiB GGUF into Metal GPU residency (`kIOGPUCommandBufferCallbackErrorOutOfMemory`). Overriding output head tensors onto the CPU buffer type (or disabling `mmap` when layers are interleaved) restricts Metal residency wiring strictly to the offloaded GPU slice (~8.3 GiB).
+* **Eliminated 400+ CPU↔Metal Graph Splits (`op_offload = false`, `n_ubatch = 256`)**: Disabled `op_offload` and capped `n_ubatch` on partially offloaded models so CPU layers run cleanly on Apple Accelerate/AMX without staging gigabytes of CPU weights through Metal command buffers during prefill.
+* **Complete Gated Delta Net / SSM Hybrid Headroom (`qwen35`, `qwen3next`, `nemotron_h`) & Metal Error Recovery**: Added missing hybrid architectures to `is_ssm_hybrid`, pre-allocated `CachedSession` up to `min(n_ctx, 32768)` on Turn 1 to avoid mid-session context teardowns, and immediately dropped/recreated poisoned `LlamaContext` instances (`ctx->has_error`) with an automatic `batch=128` retry on GPU OOM (`code -3`).
+
+#### 8. Multi-Turn Sequence State Checkpointing & Hybrid SSM Prompt Prefix Reuse (`src/compute/inference.rs`, `src/compute/ffi.rs`, `src/server/chat.rs`, `src/server/routes.rs`)
+* **Prompt State Checkpointing**: Added `save_state_to_memory` and `load_state_from_memory` in `LlamaContext` wrapping `llama_state_get_size`, `llama_state_get_data`, and `llama_state_set_data` to checkpoint evaluated sequence states in memory after prefill.
+* **Hybrid SSM Zero-Prefill Recovery**: On hybrid recurrent models (Qwen 3.5/3.8 Gated Delta Net, Gemma 4) where `llama_memory_recurrent` rejects `seq_rm` for suffix deletion, automatically restores matching prefix state checkpoints from `CachedSession.checkpoints` in $<1\text{ms}$ instead of wiping memory and re-evaluating thousands of prompt tokens from token 0.
+* **Chat Prompt Prefix Stability**: Maintained consistent `<think>` formatting in `format_qwen_chat_prompt` across turns so multi-turn assistant messages match prompt history exactly without token divergence.
+* **Non-Streaming Prefill Duration Warning**: Logged early ETA warnings when non-streaming requests with large prompts ($>12,000$ characters) arrive to advise operators on appropriate client socket timeouts ($\ge 300\text{s}$).
+
+#### 9. Sparse N-Gram Embedding Tiering & Idle Memory TTL (`src/model/tensor_role.rs`, `src/scheduler/placement.rs`, `src/compute/inference.rs`, `src/server/manager.rs`, `src/cli/serve.rs`, `src/main.rs`)
+* **Sparse N-Gram & MTP Recognition**: Added `TensorRole::NgramEmbedding` and `TensorRole::MultiTokenPrediction` to classify massive sparse lookup tables (e.g. Qwen 3.8 Flash Next's 51B parameter N-gram table) and speculative draft heads.
+* **Host RAM/NVMe Embedding Placement**: Automatically routed N-gram lookup tables to `StorageTier::Ram` / `StorageTier::Nvme` and excluded them from GPU working-set calculations, saving 25–35 GiB of GPU VRAM on massive 180B-class models.
+* **Metal Residency Protection**: Overrode N-gram embedding tensors to the CPU buffer type in `select_partial_offload_strategy_with_plan` to prevent them from being wired into Metal GPU residency collections.
+* **Idle Memory Reclamation (`--idle-timeout`)**: Added `--idle-timeout <secs>` CLI flag to `hypura serve` to automatically unload models and release all Metal unified memory allocations when inactive.
+
+#### 10. Native Jinja Template Execution & Qwen 3.8 Flash Next Startup Automation (`src/compute/ffi.rs`, `src/main.rs`, `start_qwen_flash.sh`)
+* **Built-in Chat Template Execution (`LlamaModel::apply_chat_template`)**: Bound `llama_chat_apply_template` to format conversation turns with 100% fidelity using `llama.cpp`'s native C++ template engine when custom or model-embedded templates are present. Added verification unit test `test_llama_chat_apply_template`.
+* **Flexible CLI Model Selection**: Added `-m, --model <NAME>` flag support in addition to positional arguments for `hypura serve` to prevent unexpected argument errors with complex parameter orders.
+* **Qwen 3.8 Flash Next Turnkey Launcher (`start_qwen_flash.sh`)**: Added production startup script configuring 32k context, 600s idle memory timeout, `q8_0` KV quantization, external model directory mapping, and Tailscale Funnel endpoint display.
+
+#### 11. Multi-Shard GGUF Discovery, Qwen 3.8 Flash Next Architecture & Q2_0 Quantization Support (`src/model/gguf.rs`, `src/server/registry.rs`, `src/server/manager.rs`, `src/compute/ffi.rs`, `vendor/llama.cpp`)
+* **Multi-Shard GGUF Parsing & Metadata Aggregation (`src/model/gguf.rs`)**: Extended `GgufFile::open` to detect multi-part sharded models (`*-00001-of-0000X.gguf`) and automatically parse companion shard headers (`00002..=X`), providing the ILP scheduler with full visibility into all 176.9B parameters and 1200+ tensors across shards.
+* **Recursive Model Discovery & Folder Aliasing (`src/server/registry.rs`)**: Implemented recursive scanning (up to depth 4) to find models stored in nested subdirectories (e.g. `qwen3.8-flash-next/UD-IQ3_XXS/`), added `is_non_first_shard` filter to register only the primary shard, computed cumulative multi-shard disk footprint (e.g. 77.9 GB total instead of 10 MB for the first header shard), and automatically registered parent folder aliases.
+* **Dynamic Model Manager Resolution (`src/server/manager.rs`)**: Updated initial model pre-warming in `ModelManager::new` to use `get_or_load` instead of direct file path loading, allowing short alias names (e.g. `qwen3.8-flash-next`) to resolve correctly against the registry.
+* **Qwen 3.8 Flash Next (`qwen4exp`) & Q2_0 Engine Support (`vendor/llama.cpp`, `src/compute/ffi.rs`)**:
+  * Upgraded `vendor/llama.cpp` to official `b11048` featuring full support for Alibaba's `qwen4exp` architecture (sparse Gated Delta Net, hyper-connections, QSA indexer, and PLE n-gram table embeddings).
+  * Enabled native support for `GGML_TYPE_Q2_0` (type ID 42) dynamically quantized expert tensors (`blk.*.ffn_down_exps.weight`) across CPU and Apple Silicon Metal shaders.
+  * Adapted `hypura` FFI bindings to use `load_mode` (memory-mapping) and 5-argument penalty sampler initialization. Verified end-to-end inference and token generation.
+
+---
+
+## [0.2.5] - 2026-10-06
+
+### ✨ Features & Enhancements
+
+#### 1. Dynamic Context Scaling for Agentic Coding (64k–128k tokens)
+* **Context Parameter in CLI & API (`src/main.rs`, `src/cli/estimate.rs`):**
+  * Added `-c, --context <N>` (with visible alias `--ctx-size`, default: 8192) to `hypura estimate <model>` to inspect layer offload trade-offs and KV memory consumption upfront.
+  * Standardized visible alias `--ctx-size` across `hypura run` and `hypura serve` to match Ollama/OpenAI API flags.
+  * Updated `hypura estimate` terminal output to display the auto-selected KV quantization format (`FP16`, `Q8_0`, `Q4_0`).
+
+#### 2. Adaptive 4-Bit & 8-Bit KV Cache Quantization (`src/scheduler/placement.rs`)
+* **Auto-Selected Quantization (`compute_kv_cache_plan`):**
+  * Automatically switches to `Q4_0` for contexts $\ge 32\text{k}$ tokens or when FP16 KV cache exceeds 4 GB (saving ~72% memory).
+  * Automatically switches to `Q8_0` for contexts $\ge 16\text{k}$ tokens or when memory headroom is constrained (saving ~47% memory).
+* **Quantized Headroom Accounting (`compute_tier_capacities`):**
+  * Scaled KV headroom reservation by the actual quantization factor ($0.28\times$ for Q4_0, $0.53\times$ for Q8_0) during placement calculation, preventing premature eviction of model layers to disk while keeping Metal working sets safe.
+
+#### 3. KV Cache & Context Disk Serialization (`src/compute/ffi.rs`, `src/cache/kv_cache.rs`)
+* Added `save_state_to_file` and `load_state_from_file` to `LlamaContext`, bridging to `llama_state_save_file` and `llama_state_load_file`.
+* Added `save_to_disk` and `restore_from_disk` in `KvCacheManager` for checkpointing long agent prompts and restoring sessions across restarts.
+
+#### 4. Startup Script Flexibility & CLI Parameter Forwarding (`start_hypura_funnel.sh`)
+* Added dynamic option parsing supporting `-c / --context / --ctx-size`, `-p / --port`, and arbitrary trailing Hypura CLI flags.
+* Default baseline context increased to **32k** (`32768`) for modern long-horizon agent coding workloads.
+* Supports runtime environment variables `HYPURA_CONTEXT`, `HYPURA_PORT`, and `HYPURA_EXTRA_ARGS`.
+* **Usage Examples:**
+  ```bash
+  # Launch with 64k context window (all models dynamic on-demand)
+  ./start_hypura_funnel.sh -c 65536
+
+  # Launch a specific model pre-warmed with 128k context on port 8080
+  ./start_hypura_funnel.sh qwen2.5-coder-32b -c 131072 -p 8080
+
+  # Pass custom scan directories or extra flags through to hypura serve
+  ./start_hypura_funnel.sh -c 65536 --models-dir /Volumes/Models/gguf
+  ```
+
+---
+
 ## [0.2.4] - 2026-09-09
 
 ### ✨ Features & Enhancements

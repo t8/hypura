@@ -22,6 +22,9 @@ enum Commands {
     Estimate {
         /// Path to model file or HuggingFace model ID
         model: String,
+        /// Maximum context length to estimate placement and KV cache for
+        #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "8192")]
+        context: u32,
     },
     /// List all available local and Ollama models
     List {
@@ -31,6 +34,26 @@ enum Commands {
         /// Ollama models directory (default: ~/.ollama/models)
         #[arg(long)]
         ollama_models: Option<PathBuf>,
+    },
+    /// Pull a model from Hugging Face or registry into the models directory
+    Pull {
+        /// Model name, tag, or Hugging Face repo (e.g. gemma-4:26b, qwen3.8:27b, owner/repo:quant)
+        model: String,
+        /// Target models directory (defaults to configured models directory or /Volumes/RealtekData/models)
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+        /// Overwrite existing file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove/delete a model and free disk space
+    #[command(alias = "delete")]
+    Rm {
+        /// Model name, tag, or file path to remove
+        model: String,
+        /// Target models directory
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
     },
     /// List currently running and active loaded models
     Ps {
@@ -46,7 +69,7 @@ enum Commands {
         /// Path to model file
         model: String,
         /// Maximum context length
-        #[arg(long, default_value = "4096")]
+        #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "4096")]
         context: u32,
         /// Single prompt (non-interactive mode)
         #[arg(long)]
@@ -62,14 +85,17 @@ enum Commands {
     Serve {
         /// Optional initial model to pre-load (dynamic on-demand if omitted)
         model: Option<String>,
+        /// Optional initial model name or path via flag
+        #[arg(short = 'm', long = "model")]
+        model_flag: Option<String>,
         /// Host to bind to
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to bind to
-        #[arg(long, default_value = "8080")]
+        #[arg(short = 'p', long = "port", default_value = "8080")]
         port: u16,
         /// Default context length (can be overridden per request via num_ctx)
-        #[arg(long, default_value = "4096")]
+        #[arg(short = 'c', long = "context", visible_alias = "ctx-size", default_value = "4096")]
         context: u32,
         /// Custom models directory to scan
         #[arg(long)]
@@ -77,6 +103,12 @@ enum Commands {
         /// Ollama models directory (default: ~/.ollama/models)
         #[arg(long)]
         ollama_models: Option<PathBuf>,
+        /// Idle timeout in seconds before unloading model to free unified memory (0 to disable)
+        #[arg(long, default_value = "0")]
+        idle_timeout: u64,
+        /// KV cache quantization type: f16, q8_0, or q4_0 (auto-selected by context size if omitted)
+        #[arg(long)]
+        kv_quant: Option<String>,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -133,11 +165,20 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Profile { force } => cli::profile::run(force),
-        Commands::Estimate { model } => cli::estimate::run(&model),
+        Commands::Estimate { model, context } => cli::estimate::run(&model, context),
         Commands::List {
             models_dir,
             ollama_models,
         } => cli::list::run(models_dir, ollama_models),
+        Commands::Pull {
+            model,
+            models_dir,
+            force,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cli::pull::run(model, models_dir, force))
+        }
+        Commands::Rm { model, models_dir } => cli::rm::run(model, models_dir),
         Commands::Ps { host, port } => cli::ps::run(&host, port),
         Commands::Run {
             model,
@@ -148,18 +189,23 @@ fn main() -> anyhow::Result<()> {
         } => cli::run::run(&model, context, prompt.as_deref(), interactive, max_tokens),
         Commands::Serve {
             model,
+            model_flag,
             host,
             port,
             context,
             models_dir,
             ollama_models,
+            idle_timeout,
+            kv_quant,
         } => cli::serve::run(
-            model.as_deref(),
+            model.or(model_flag).as_deref(),
             &host,
             port,
             context,
             models_dir,
             ollama_models,
+            idle_timeout,
+            kv_quant,
         ),
         Commands::Bench {
             model,

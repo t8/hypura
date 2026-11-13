@@ -14,12 +14,14 @@ pub struct OpenAIChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stop_sequences")]
     pub stop: Option<Vec<String>>,
     #[serde(default)]
     pub seed: Option<u32>,
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
     #[serde(default)]
@@ -47,16 +49,24 @@ impl OpenAIChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIChatMessage {
     pub role: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_openai_content",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAIToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
     pub id: String,
     #[serde(rename = "type")]
     pub call_type: String,
@@ -67,6 +77,59 @@ pub struct OpenAIToolCall {
 pub struct OpenAIFunctionCall {
     pub name: String,
     pub arguments: String,
+}
+
+fn deserialize_openai_content<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match val {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut joined = String::new();
+            for part in parts {
+                match part {
+                    serde_json::Value::String(s) => joined.push_str(&s),
+                    serde_json::Value::Object(map) => {
+                        if let Some(text) = map
+                            .get("text")
+                            .or_else(|| map.get("content"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !joined.is_empty() && !joined.ends_with('\n') && !text.starts_with('\n') {
+                                joined.push('\n');
+                            }
+                            joined.push_str(text);
+                        }
+                    }
+                    other => joined.push_str(&other.to_string()),
+                }
+            }
+            Ok(Some(joined))
+        }
+        Some(other) => Ok(Some(other.to_string())),
+    }
+}
+
+fn deserialize_stop_sequences<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match val {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(vec![s])),
+        Some(serde_json::Value::Array(arr)) => {
+            let stops = arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            Ok(Some(stops))
+        }
+        Some(_) => Ok(None),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,7 +144,7 @@ pub struct OpenAICompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stop_sequences")]
     pub stop: Option<Vec<String>>,
     #[serde(default)]
     pub num_ctx: Option<u32>,

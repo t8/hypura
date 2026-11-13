@@ -25,13 +25,17 @@ pub struct ChatRequest {
     pub tools: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, alias = "name", skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,6 +73,37 @@ pub struct GenerateOptions {
 #[derive(Debug, Deserialize)]
 pub struct ShowRequest {
     pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteRequest {
+    #[serde(alias = "model")]
+    pub name: String,
+    #[serde(default)]
+    pub models_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PullRequest {
+    #[serde(alias = "model")]
+    pub name: String,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    #[serde(default)]
+    pub models_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PullResponseChunk {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
 }
 
 // ── Response types ──
