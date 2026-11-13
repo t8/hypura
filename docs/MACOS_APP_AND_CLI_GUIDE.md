@@ -117,6 +117,22 @@ cp -R dist/Hypura.app /Applications/
 open /Applications/Hypura.app
 ```
 
+### Packaging a Distributable `.dmg` Installer
+To build a drag-and-drop installer DMG (located at `dist/Hypura-*.dmg`):
+```bash
+./scripts/package_dmg.sh
+```
+
+For official distribution with Apple Developer ID and Notarization:
+```bash
+export DEVELOPER_ID="Developer ID Application: Your Name (TEAM_ID)"
+export APPLE_ID="developer@example.com"
+export APPLE_TEAM_ID="TEAM_ID"
+export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+
+./scripts/package_dmg.sh
+```
+
 ---
 
 ## 4. Runtime Models Library Overrides
