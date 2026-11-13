@@ -35,14 +35,24 @@ if [ "$1" == "--developer-id" ]; then
     ENTITLEMENTS="$ROOT_DIR/mac-app/Hypura-DeveloperID.entitlements"
 fi
 
+# Auto-detect code signing identity from Keychain if not explicitly provided
+if [ -z "$SIGNING_IDENTITY" ]; then
+    DETECTED_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Developer ID Application|Apple Development" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -n "$DETECTED_IDENTITY" ]; then
+        SIGNING_IDENTITY="$DETECTED_IDENTITY"
+    fi
+fi
+
 if [ -n "$SIGNING_IDENTITY" ]; then
-    echo "==> Signing binaries with identity: $SIGNING_IDENTITY..."
-    codesign --deep --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$PRODUCTS_APP_DIR/Hypura.app/Contents/MacOS/hypura-bin"
-    codesign --deep --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$PRODUCTS_APP_DIR/Hypura.app"
+    echo "==> Signing binaries with identity and Hardened Runtime: $SIGNING_IDENTITY..."
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$PRODUCTS_APP_DIR/Hypura.app/Contents/MacOS/hypura-bin"
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$PRODUCTS_APP_DIR/Hypura.app/Contents/MacOS/Hypura"
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$PRODUCTS_APP_DIR/Hypura.app"
 else
-    echo "==> Ad-hoc signing with entitlements (Xcode Organizer will re-sign on distribution)..."
-    codesign --deep --force --entitlements "$ENTITLEMENTS" -s - "$PRODUCTS_APP_DIR/Hypura.app/Contents/MacOS/hypura-bin"
-    codesign --deep --force --entitlements "$ENTITLEMENTS" -s - "$PRODUCTS_APP_DIR/Hypura.app"
+    echo "==> Signing with Hardened Runtime (ad-hoc)..."
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" -s - "$PRODUCTS_APP_DIR/Hypura.app/Contents/MacOS/hypura-bin"
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" -s - "$PRODUCTS_APP_DIR/Hypura.app/Contents/MacOS/Hypura"
+    codesign --force --options runtime --entitlements "$ENTITLEMENTS" -s - "$PRODUCTS_APP_DIR/Hypura.app"
 fi
 
 # Create archive Info.plist
